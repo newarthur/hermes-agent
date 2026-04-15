@@ -435,7 +435,7 @@ class CopilotACPClient:
             raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
 
         try:
-            _request(
+            init_result = _request(
                 "initialize",
                 {
                     "protocolVersion": 1,
@@ -451,7 +451,18 @@ class CopilotACPClient:
                         "version": "0.0.0",
                     },
                 },
-            )
+            ) or {}
+            command_name = Path(self._acp_command).name.lower()
+            is_gemini_acp = command_name == "gemini" or str(self.base_url).startswith("acp://gemini-cli")
+            if is_gemini_acp:
+                auth_methods = init_result.get("authMethods") if isinstance(init_result, dict) else []
+                auth_method_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in auth_methods
+                    if isinstance(item, dict)
+                }
+                if "oauth-personal" in auth_method_ids:
+                    _request("authenticate", {"methodId": "oauth-personal"})
             session = _request(
                 "session/new",
                 {

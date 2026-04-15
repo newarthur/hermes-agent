@@ -471,6 +471,177 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+
+def _normalize_persona_fallback(route: dict | None) -> list | dict | None:
+    """Normalize fallback config embedded in a persona route."""
+    if not isinstance(route, dict):
+        return None
+    fb_chain = route.get("fallback_providers")
+    if isinstance(fb_chain, list) and fb_chain:
+        return fb_chain
+    fb_single = route.get("fallback_model")
+    if isinstance(fb_single, dict) and fb_single:
+        return fb_single
+    return None
+
+
+
+def _load_active_personality(config: dict | None = None) -> str:
+    """Read the currently selected personality name from config.yaml."""
+    cfg = config if config is not None else _load_gateway_config()
+    display_cfg = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+    if isinstance(display_cfg, dict):
+        active = str(display_cfg.get("personality", "") or "").strip().lower()
+        if active and active not in {"none", "default", "neutral"}:
+            return active
+    return ""
+
+
+
+def _load_persona_model_routes(config: dict | None = None) -> dict:
+    """Load optional per-personality model routing config."""
+    cfg = config if config is not None else _load_gateway_config()
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    routes = agent_cfg.get("persona_model_routes", {}) if isinstance(agent_cfg, dict) else {}
+    return routes if isinstance(routes, dict) else {}
+
+
+
+def _format_persona_route_summary(personality: str, config: dict | None = None) -> list[str]:
+    """Return human-readable primary/fallback lines for a personality route."""
+    route = _load_persona_model_routes(config).get((personality or "").strip().lower())
+    if not isinstance(route, dict):
+        return []
+
+    primary_provider = str(route.get("provider") or "").strip()
+    primary_model = str(route.get("model") or route.get("default") or "").strip()
+    if not primary_model:
+        return []
+
+    lines = [f"Primary: {primary_provider or 'default'} / {primary_model}"]
+    fallback = _normalize_persona_fallback(route)
+    if isinstance(fallback, dict) and fallback:
+        fb_provider = str(fallback.get("provider") or "").strip()
+        fb_model = str(fallback.get("model") or "").strip()
+        if fb_model:
+            lines.append(f"Fallback: {fb_provider or 'default'} / {fb_model}")
+    elif isinstance(fallback, list) and fallback:
+        for idx, item in enumerate(fallback, start=1):
+            if not isinstance(item, dict):
+                continue
+            fb_provider = str(item.get("provider") or "").strip()
+            fb_model = str(item.get("model") or "").strip()
+            if fb_model:
+                lines.append(f"Fallback {idx}: {fb_provider or 'default'} / {fb_model}")
+    return lines
+
+
+
+def _rewrite_natural_personality_switch(text: str) -> str:
+    """Map common natural-language Chinese persona switches to /personality."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    normalized = raw.replace("：", "").replace(":", "").replace(" ", "")
+    mapping = {
+        "切助理": "hermes_main",
+        "切主助理": "hermes_main",
+        "切到助理": "hermes_main",
+        "切到主助理": "hermes_main",
+        "切通用": "hermes_main",
+        "切到通用": "hermes_main",
+        "切科研": "osahs_research",
+        "切到科研": "osahs_research",
+        "科研模式": "osahs_research",
+        "学术模式": "osahs_research",
+        "切运维": "openclaw_ops",
+        "切到运维": "openclaw_ops",
+        "运维模式": "openclaw_ops",
+        "系统模式": "openclaw_ops",
+    }
+    personality = mapping.get(normalized)
+    return f"/personality {personality}" if personality else raw
+
+
+
+def _match_natural_status_query(text: str) -> bool:
+    """Return True when the message asks for current persona/model state."""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    normalized = raw.replace("：", "").replace(":", "").replace(" ", "")
+    return normalized in {
+        "你现在是什么人格",
+        "你现在是哪个人格",
+        "当前人格",
+        "当前模型",
+        "当前状态",
+        "当前助理",
+    }
+
+
+
+def _build_natural_status_response(config: dict | None = None) -> str:
+    """Build a compact status summary for natural-language status queries."""
+    cfg = config if config is not None else _load_gateway_config()
+    personality = _load_active_personality(cfg) or "none"
+    lines = [f"当前人格：{personality}"]
+
+    route = _load_persona_model_routes(cfg).get(personality, {}) if personality != "none" else {}
+    if isinstance(route, dict) and route:
+        provider = str(route.get("provider") or "default").strip()
+        model = str(route.get("model") or route.get("default") or "").strip()
+        if model:
+            lines.append(f"主模型：{provider} / {model}")
+        fallback = _normalize_persona_fallback(route)
+        if isinstance(fallback, dict) and fallback:
+            fb_provider = str(fallback.get("provider") or "default").strip()
+            fb_model = str(fallback.get("model") or "").strip()
+            if fb_model:
+                lines.append(f"Fallback：{fb_provider} / {fb_model}")
+        elif isinstance(fallback, list) and fallback:
+            for idx, item in enumerate(fallback, start=1):
+                if not isinstance(item, dict):
+                    continue
+                fb_provider = str(item.get("provider") or "default").strip()
+                fb_model = str(item.get("model") or "").strip()
+                if fb_model:
+                    lines.append(f"Fallback {idx}：{fb_provider} / {fb_model}")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        providers_to_check = []
+        if route.get("provider"):
+            providers_to_check.append(str(route.get("provider")))
+        fallback = _normalize_persona_fallback(route)
+        if isinstance(fallback, dict) and fallback.get("provider"):
+            providers_to_check.append(str(fallback.get("provider")))
+        elif isinstance(fallback, list):
+            for item in fallback:
+                if isinstance(item, dict) and item.get("provider"):
+                    providers_to_check.append(str(item.get("provider")))
+
+        seen = set()
+        status_lines = []
+        for provider_id in providers_to_check:
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            try:
+                runtime = resolve_runtime_provider(requested=provider_id)
+                ready = bool(runtime.get("api_key") or runtime.get("command") or runtime.get("credential_pool"))
+                status_lines.append(f"{provider_id}: {'可用' if ready else '未就绪'}")
+            except Exception as exc:
+                status_lines.append(f"{provider_id}: 异常 ({str(exc)[:80]})")
+        if status_lines:
+            lines.append("Provider状态：")
+            lines.extend(f"- {line}" for line in status_lines)
+    else:
+        lines.append("当前未配置对应的人格路由")
+
+    return "\n".join(lines)
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -762,7 +933,7 @@ class GatewayRunner:
                 return
 
             from run_agent import AIAgent
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            model, runtime_kwargs, fallback_model = self._resolve_session_agent_runtime(
                 session_key=session_key,
             )
             if not runtime_kwargs.get("api_key"):
@@ -776,6 +947,7 @@ class GatewayRunner:
                 skip_memory=True,  # Flush agent — no memory provider
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
+                fallback_model=fallback_model,
             )
             try:
                 # Fully silence the flush agent — quiet_mode only suppresses init
@@ -893,18 +1065,91 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _resolve_persona_route(
+        self,
+        *,
+        config: Optional[dict],
+        model: str,
+        runtime_kwargs: dict,
+        fallback_model: list | dict | None = None,
+    ) -> tuple[str, dict, list | dict | None]:
+        """Apply per-personality model routing when configured."""
+        active_persona = _load_active_personality(config)
+        routes = _load_persona_model_routes(config)
+        route = routes.get(active_persona)
+        if not active_persona or not isinstance(route, dict):
+            return model, runtime_kwargs, fallback_model
+
+        resolved_model = str(route.get("model") or route.get("default") or model or "").strip()
+        resolved_provider = str(route.get("provider") or runtime_kwargs.get("provider") or "").strip()
+
+        persona_runtime = dict(runtime_kwargs or {})
+        explicit_runtime = any(
+            route.get(key)
+            for key in ("api_key", "base_url", "api_mode", "command", "credential_pool")
+        ) or bool(route.get("args"))
+        provider_changed = bool(resolved_provider and resolved_provider != str(runtime_kwargs.get("provider") or "").strip())
+
+        if provider_changed or explicit_runtime:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                resolved_runtime = resolve_runtime_provider(
+                    requested=resolved_provider or None,
+                    explicit_api_key=route.get("api_key"),
+                    explicit_base_url=route.get("base_url"),
+                )
+                runtime_ready = bool(
+                    resolved_runtime.get("api_key")
+                    or resolved_runtime.get("command")
+                    or resolved_runtime.get("credential_pool")
+                )
+                if provider_changed and not runtime_ready:
+                    logger.warning(
+                        "Skipping persona route '%s' because provider '%s' has no runtime credentials",
+                        active_persona,
+                        resolved_provider,
+                    )
+                    return model, runtime_kwargs, fallback_model
+                persona_runtime = {
+                    "api_key": resolved_runtime.get("api_key"),
+                    "base_url": resolved_runtime.get("base_url"),
+                    "provider": resolved_runtime.get("provider"),
+                    "api_mode": resolved_runtime.get("api_mode"),
+                    "command": resolved_runtime.get("command"),
+                    "args": list(resolved_runtime.get("args") or []),
+                    "credential_pool": resolved_runtime.get("credential_pool"),
+                }
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve runtime for persona route '%s': %s",
+                    active_persona,
+                    exc,
+                )
+
+        for key in ("api_key", "base_url", "api_mode", "command", "credential_pool"):
+            if route.get(key):
+                persona_runtime[key] = route.get(key)
+        if route.get("provider"):
+            persona_runtime["provider"] = resolved_provider
+        if "args" in route and route.get("args") is not None:
+            persona_runtime["args"] = list(route.get("args") or [])
+
+        return resolved_model, persona_runtime, _normalize_persona_fallback(route) or fallback_model
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
-    ) -> tuple[str, dict]:
-        """Resolve model/runtime for a session, honoring session-scoped /model overrides.
+    ) -> tuple[str, dict, list | dict | None]:
+        """Resolve model/runtime/fallback for a session.
 
-        If the session override already contains a complete provider bundle
-        (provider/api_key/base_url/api_mode), prefer it directly instead of
-        resolving fresh global runtime state first.
+        Precedence:
+        1. Session-scoped /model override
+        2. Active personality route from agent.persona_model_routes
+        3. Global model/runtime/fallback config
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -914,6 +1159,7 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        fallback_model = self._fallback_model
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -929,7 +1175,7 @@ class GatewayRunner:
                     (resolved_session_key or "")[:30], model, override_model,
                     override_runtime.get("provider"),
                 )
-                return override_model, override_runtime
+                return override_model, override_runtime, fallback_model
             # Override exists but has no api_key — fall through to env-based
             # resolution and apply model/provider from the override on top.
             logger.debug(
@@ -965,7 +1211,13 @@ class GatewayRunner:
             except Exception:
                 pass
 
-        return model, runtime_kwargs
+        model, runtime_kwargs, fallback_model = self._resolve_persona_route(
+            config=user_config,
+            model=model,
+            runtime_kwargs=runtime_kwargs,
+            fallback_model=fallback_model,
+        )
+        return model, runtime_kwargs, fallback_model
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -2707,6 +2959,9 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        event.text = _rewrite_natural_personality_switch(event.text)
+        if _match_natural_status_query(event.text):
+            return _build_natural_status_response()
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -3666,7 +3921,7 @@ class GatewayRunner:
                         ).lower() in ("true", "1", "yes")
 
                 try:
-                    _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
+                    _hyg_model, _hyg_runtime, _ = self._resolve_session_agent_runtime(
                         source=source,
                         session_key=session_key,
                         user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
@@ -5015,12 +5270,19 @@ class GatewayRunner:
         return "\n".join(lines)
     
     async def _handle_personality_command(self, event: MessageEvent) -> str:
-        """Handle /personality command - list or set a personality."""
+        """Handle /personality command - list or set a personality.
+
+        Important behavior: changing personality should also release any session-level
+        /model override, otherwise the override would continue to win over
+        persona_model_routes and make personality-specific model routing appear broken.
+        """
         import yaml
         from hermes_constants import display_hermes_home
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / 'config.yaml'
+        source = event.source
+        session_key = self._session_key_for_source(source) if source is not None else None
 
         try:
             if config_path.exists():
@@ -5059,16 +5321,33 @@ class GatewayRunner:
                 return "\n".join(p for p in parts if p)
             return str(value)
 
+        def _clear_session_model_override() -> bool:
+            """Drop any session /model override so personality routing can apply."""
+            if not session_key:
+                return False
+            cleared = False
+            if hasattr(self, "_session_model_overrides") and session_key in self._session_model_overrides:
+                self._session_model_overrides.pop(session_key, None)
+                cleared = True
+            if hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes.pop(session_key, None)
+            return cleared
+
         if args in ("none", "default", "neutral"):
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = ""
+                config["display"]["personality"] = "none"
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
             self._ephemeral_system_prompt = ""
-            return "🎭 Personality cleared — using base agent behavior.\n_(takes effect on next message)_"
+            cleared_override = _clear_session_model_override()
+            suffix = "\nSession /model override cleared so personality routing can apply." if cleared_override else ""
+            return f"🎭 Personality cleared — using base agent behavior.{suffix}\n_(takes effect on next message)_"
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
 
@@ -5076,15 +5355,22 @@ class GatewayRunner:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = new_prompt
+                config["display"]["personality"] = args
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
 
             # Update in-memory so it takes effect on the very next message.
             self._ephemeral_system_prompt = new_prompt
+            cleared_override = _clear_session_model_override()
 
-            return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
+            route_lines = _format_persona_route_summary(args, config)
+            details = "\n" + "\n".join(route_lines) if route_lines else ""
+            override_note = "\nSession /model override cleared so persona route can take over." if cleared_override else ""
+            return f"🎭 Personality set to **{args}**{details}{override_note}\n_(takes effect on next message)_"
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
@@ -5703,7 +5989,7 @@ class GatewayRunner:
 
         try:
             user_config = _load_gateway_config()
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            model, runtime_kwargs, fallback_model = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
             )
@@ -5748,7 +6034,7 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=fallback_model,
                 )
                 try:
                     return agent.run_conversation(
@@ -5876,7 +6162,7 @@ class GatewayRunner:
 
         try:
             user_config = _load_gateway_config()
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            model, runtime_kwargs, fallback_model = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
                 user_config=user_config,
@@ -5929,7 +6215,7 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     session_db=None,
-                    fallback_model=self._fallback_model,
+                    fallback_model=fallback_model,
                     skip_memory=True,
                     skip_context_files=True,
                     persist_session=False,
@@ -6246,7 +6532,7 @@ class GatewayRunner:
             from agent.model_metadata import estimate_messages_tokens_rough
 
             session_key = self._session_key_for_source(source)
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            model, runtime_kwargs, fallback_model = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
             )
@@ -6269,6 +6555,7 @@ class GatewayRunner:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                fallback_model=fallback_model,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
@@ -8492,7 +8779,7 @@ class GatewayRunner:
                 pass
 
             try:
-                model, runtime_kwargs = self._resolve_session_agent_runtime(
+                model, runtime_kwargs, fallback_model = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
@@ -8645,7 +8932,7 @@ class GatewayRunner:
                     user_id=source.user_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=fallback_model,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

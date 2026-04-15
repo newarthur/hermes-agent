@@ -1477,6 +1477,32 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+def _rewrite_natural_personality_switch(text: str) -> str:
+    """Map common natural-language Chinese persona switches to /personality."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    normalized = raw.replace("：", "").replace(":", "").replace(" ", "")
+    mapping = {
+        "切助理": "hermes_main",
+        "切主助理": "hermes_main",
+        "切到助理": "hermes_main",
+        "切到主助理": "hermes_main",
+        "切通用": "hermes_main",
+        "切到通用": "hermes_main",
+        "切科研": "osahs_research",
+        "切到科研": "osahs_research",
+        "科研模式": "osahs_research",
+        "学术模式": "osahs_research",
+        "切运维": "openclaw_ops",
+        "切到运维": "openclaw_ops",
+        "运维模式": "openclaw_ops",
+        "系统模式": "openclaw_ops",
+    }
+    personality = mapping.get(normalized)
+    return f"/personality {personality}" if personality else raw
+
+
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -4924,6 +4950,42 @@ class HermesCLI:
             return "\n".join(p for p in parts if p)
         return str(value)
 
+    @staticmethod
+    def _format_personality_route_summary(personality_name: str):
+        """Return configured primary/fallback routing lines for a personality."""
+        try:
+            config_path = _hermes_home / 'config.yaml'
+            if not config_path.exists():
+                return []
+            import yaml
+            with open(config_path, encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+            route = ((cfg.get('agent', {}) or {}).get('persona_model_routes', {}) or {}).get(personality_name)
+            if not isinstance(route, dict):
+                return []
+            model = str(route.get('model') or route.get('default') or '').strip()
+            provider = str(route.get('provider') or '').strip()
+            if not model:
+                return []
+            lines = [f"  Primary: {provider or 'default'} / {model}"]
+            fallback = route.get('fallback_model')
+            if isinstance(fallback, dict):
+                fb_model = str(fallback.get('model') or '').strip()
+                fb_provider = str(fallback.get('provider') or '').strip()
+                if fb_model:
+                    lines.append(f"  Fallback: {fb_provider or 'default'} / {fb_model}")
+            elif isinstance(route.get('fallback_providers'), list):
+                for idx, item in enumerate(route.get('fallback_providers') or [], start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    fb_model = str(item.get('model') or '').strip()
+                    fb_provider = str(item.get('provider') or '').strip()
+                    if fb_model:
+                        lines.append(f"  Fallback {idx}: {fb_provider or 'default'} / {fb_model}")
+            return lines
+        except Exception:
+            return []
+
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
         parts = cmd.split(maxsplit=1)
@@ -4935,7 +4997,9 @@ class HermesCLI:
             if personality_name in ("none", "default", "neutral"):
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                saved_prompt = save_config_value("agent.system_prompt", "")
+                saved_name = save_config_value("display.personality", "none")
+                if saved_prompt and saved_name:
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
                     print("(^_^) Personality cleared (session only)")
@@ -4943,10 +5007,53 @@ class HermesCLI:
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                saved_prompt = save_config_value("agent.system_prompt", self.system_prompt)
+                saved_name = save_config_value("display.personality", personality_name)
+                # Apply per-persona model routing when configured
+                route = ((CLI_CONFIG.get('agent', {}) or {}).get('persona_model_routes', {}) or {}).get(personality_name)
+                if isinstance(route, dict) and (route.get('model') or route.get('default')):
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        resolved = resolve_runtime_provider(
+                            requested=route.get('provider'),
+                            explicit_api_key=route.get('api_key'),
+                            explicit_base_url=route.get('base_url'),
+                        )
+                        self.model = str(route.get('model') or route.get('default') or self.model).strip()
+                        self.provider = resolved.get('provider') or route.get('provider') or self.provider
+                        self.requested_provider = self.provider
+                        if resolved.get('api_key'):
+                            self.api_key = resolved['api_key']
+                            self._explicit_api_key = resolved['api_key']
+                        if resolved.get('base_url'):
+                            self.base_url = resolved['base_url']
+                            self._explicit_base_url = resolved['base_url']
+                        if resolved.get('api_mode'):
+                            self.api_mode = resolved['api_mode']
+                        if resolved.get('command'):
+                            self.acp_command = resolved['command']
+                        if resolved.get('args') is not None:
+                            self.acp_args = list(resolved['args'])
+                        if self.agent is not None:
+                            try:
+                                self.agent.switch_model(
+                                    new_model=self.model,
+                                    new_provider=self.provider,
+                                    api_key=self.api_key,
+                                    base_url=self.base_url,
+                                    api_mode=self.api_mode,
+                                )
+                            except Exception as exc:
+                                print(f"  ⚠ Agent swap failed ({exc}); change applied to next turn.")
+                                self.agent = None
+                    except Exception as exc:
+                        print(f"  ⚠ Could not resolve persona model route: {exc}")
+                if saved_prompt and saved_name:
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
+                for line in self._format_personality_route_summary(personality_name):
+                    print(line)
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
@@ -9602,6 +9709,10 @@ class HermesCLI:
                                 f"[User attached file: {_drop_path}]"
                                 + (f"\n{_remainder}" if _remainder else "")
                             )
+
+                    # Rewrite natural-language personality switches before slash-command detection
+                    if isinstance(user_input, str):
+                        user_input = _rewrite_natural_personality_switch(user_input)
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
                         _cprint(f"\n⚙️  {user_input}")

@@ -958,7 +958,7 @@ class AIAgent:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-                if self.provider == "copilot-acp":
+                if self.provider == "copilot-acp" or self.provider == "google-gemini-cli" or self.acp_command or str(base_url).startswith("acp://"):
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
@@ -4342,12 +4342,17 @@ class AIAgent:
         from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        if (
+            self.provider in {"copilot-acp", "google-gemini-cli"}
+            or str(client_kwargs.get("base_url", "")).startswith("acp://")
+            or str(client_kwargs.get("base_url", "")).startswith("acp+tcp://")
+            or client_kwargs.get("command")
+        ):
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(**client_kwargs)
             logger.info(
-                "Copilot ACP client created (%s, shared=%s) %s",
+                "ACP client created (%s, shared=%s) %s",
                 reason,
                 shared,
                 self._client_log_context(),

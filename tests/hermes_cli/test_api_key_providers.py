@@ -134,6 +134,7 @@ PROVIDER_ENV_VARS = (
     "NOUS_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_BASE_URL", "HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH",
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_ACP_BASE_URL",
+    "HERMES_GEMINI_ACP_COMMAND", "GEMINI_CLI_PATH", "HERMES_GEMINI_ACP_ARGS", "GEMINI_ACP_BASE_URL",
 )
 
 
@@ -344,6 +345,19 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
+    def test_google_gemini_cli_status_detects_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GEMINI_ACP_ARGS", "--acp --stdio --debug")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        status = get_auth_status("google-gemini-cli")
+
+        assert status["configured"] is True
+        assert status["provider"] == "google-gemini-cli"
+        assert status["command"] == "gemini"
+        assert status["resolved_command"] == "/usr/local/bin/gemini"
+        assert status["args"] == ["--acp", "--stdio", "--debug"]
+        assert status["base_url"] == "acp://gemini-cli"
+
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
@@ -413,9 +427,22 @@ class TestResolveApiKeyProviderCredentials:
         creds = resolve_external_process_provider_credentials("copilot-acp")
 
         assert creds["provider"] == "copilot-acp"
-        assert creds["api_key"] == "copilot-acp"
+        assert creds["api_key"] == "***"
         assert creds["base_url"] == "acp://copilot"
         assert creds["command"] == "/usr/local/bin/copilot"
+        assert creds["args"] == ["--acp", "--stdio"]
+        assert creds["source"] == "process"
+
+    def test_resolve_google_gemini_cli_with_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GEMINI_ACP_ARGS", "--acp --stdio")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+
+        creds = resolve_external_process_provider_credentials("google-gemini-cli")
+
+        assert creds["provider"] == "google-gemini-cli"
+        assert creds["api_key"] == "gemini-cli-acp"
+        assert creds["base_url"] == "acp://gemini-cli"
+        assert creds["command"] == "/usr/local/bin/gemini"
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
 
@@ -590,9 +617,24 @@ class TestRuntimeProviderResolution:
 
         assert result["provider"] == "copilot-acp"
         assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "copilot-acp"
+        assert result["api_key"] == "***"
         assert result["base_url"] == "acp://copilot"
         assert result["command"] == "/usr/local/bin/copilot"
+        assert result["args"] == ["--acp", "--stdio", "--debug"]
+
+    def test_runtime_google_gemini_cli_uses_process_runtime(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+        monkeypatch.setenv("HERMES_GEMINI_ACP_ARGS", "--acp --stdio --debug")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="google-gemini-cli")
+
+        assert result["provider"] == "google-gemini-cli"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "gemini-cli-acp"
+        assert result["base_url"] == "acp://gemini-cli"
+        assert result["command"] == "/usr/local/bin/gemini"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
 
 

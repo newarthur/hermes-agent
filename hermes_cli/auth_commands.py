@@ -33,7 +33,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "qwen-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {"nous", "openai-codex", "google-gemini-cli", "qwen-oauth"}
 
 
 def _get_custom_provider_names() -> list:
