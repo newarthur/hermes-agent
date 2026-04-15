@@ -48,7 +48,11 @@ class TestCLIPersonalityNone:
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True) as mock_save:
             cli._handle_personality_command("/personality none")
-        mock_save.assert_called_once_with("agent.system_prompt", "")
+        from unittest.mock import call
+        mock_save.assert_has_calls([
+            call("agent.system_prompt", ""),
+            call("display.personality", "none"),
+        ], any_order=True)
 
     def test_known_personality_still_works(self):
         cli = self._make_cli()

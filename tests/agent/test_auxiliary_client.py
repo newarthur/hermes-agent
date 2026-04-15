@@ -105,7 +105,8 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        result = _read_codex_access_token()
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            result = _read_codex_access_token()
         assert result is None
 
     def test_malformed_json_returns_none(self, tmp_path):
