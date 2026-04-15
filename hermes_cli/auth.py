@@ -148,8 +148,10 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "google-gemini-cli": ProviderConfig(
         id="google-gemini-cli",
         name="Google Gemini CLI",
-        auth_type="oauth_external",
-        inference_base_url="https://cloudcode-pa.googleapis.com",
+        auth_type="oauth_google",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        base_url_env_var="GEMINI_BASE_URL",
     ),
     "zai": ProviderConfig(
         id="zai",
@@ -993,9 +995,10 @@ def resolve_provider(
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
-    # Auto-detect API-key providers by checking their env vars
+    # Auto-detect API-key providers by checking their env vars.
+    # Also allow "oauth_google" providers like gemini that accept legacy API keys.
     for pid, pconfig in PROVIDER_REGISTRY.items():
-        if pconfig.auth_type != "api_key":
+        if pconfig.auth_type not in ("api_key", "oauth_google"):
             continue
         # GitHub tokens are commonly present for repo/tool access but should not
         # hijack inference auto-selection unless the user explicitly chooses
@@ -1594,43 +1597,59 @@ def resolve_codex_runtime_credentials(
     }
 
 
-def resolve_gemini_runtime_credentials() -> Dict[str, Any]:
-    """Resolve runtime credentials from Hermes's Google Gemini CLI auth store."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store(_lock=False)
-    state = _load_provider_state(auth_store, "google-gemini-cli")
-    if not state:
-        raise AuthError(
-            "No Google Gemini CLI credentials stored. Run `hermes auth` to authenticate.",
-            provider="google-gemini-cli",
-            code="gemini_auth_missing",
-            relogin_required=True,
+def resolve_gemini_runtime_credentials(
+    *,
+    refresh_if_expiring: bool = True,
+) -> Dict[str, Any]:
+    """Resolve runtime credentials from Hermes's Gemini OAuth store."""
+    from agent import google_oauth
+
+    try:
+        access_token = google_oauth.get_valid_access_token(
+            refresh_if_expiring=refresh_if_expiring,
+            skew_seconds=google_oauth.REFRESH_SKEW_SECONDS,
         )
-    tokens = state.get("tokens")
-    if not isinstance(tokens, dict):
+    except RuntimeError as exc:
         raise AuthError(
-            "Google Gemini CLI auth state is missing tokens. Run `hermes auth` to re-authenticate.",
+            str(exc),
             provider="google-gemini-cli",
-            code="gemini_auth_invalid_shape",
+            code="gemini_oauth_missing",
             relogin_required=True,
-        )
-    access_token = str(tokens.get("access_token", "") or "").strip()
-    if not access_token:
-        raise AuthError(
-            "Google Gemini CLI auth is missing access_token. Run `hermes auth` to re-authenticate.",
-            provider="google-gemini-cli",
-            code="gemini_auth_missing_access_token",
-            relogin_required=True,
-        )
+        ) from exc
+
     pconfig = PROVIDER_REGISTRY.get("google-gemini-cli")
-    base_url = pconfig.inference_base_url if pconfig else "https://cloudcode-pa.googleapis.com"
+    base_url = (
+        pconfig.inference_base_url
+        if pconfig
+        else "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
     return {
         "provider": "google-gemini-cli",
         "base_url": base_url,
         "api_key": access_token,
-        "source": "hermes-auth-store",
-        "last_refresh": state.get("last_refresh"),
+        "source": "google-oauth-pkce",
     }
+
+
+def get_gemini_auth_status() -> Dict[str, Any]:
+    """Status snapshot for Gemini OAuth."""
+    from agent import google_oauth
+
+    auth_path = google_oauth.GEMINI_OAUTH_FILE
+    try:
+        creds = resolve_gemini_runtime_credentials(refresh_if_expiring=False)
+        return {
+            "logged_in": True,
+            "auth_file": str(auth_path),
+            "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
+        }
+    except AuthError as exc:
+        return {
+            "logged_in": False,
+            "auth_file": str(auth_path),
+            "error": str(exc),
+        }
 
 
 # =============================================================================
@@ -2478,29 +2497,19 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or (pconfig.auth_type != "external_process" and provider_id != "google-gemini-cli"):
+    if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    if provider_id == "google-gemini-cli":
-        command = (
-            os.getenv("HERMES_GEMINI_ACP_COMMAND", "").strip()
-            or os.getenv("GEMINI_CLI_PATH", "").strip()
-            or "gemini"
-        )
-        raw_args = os.getenv("HERMES_GEMINI_ACP_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["--acp"]
-        base_url = os.getenv("GEMINI_ACP_BASE_URL", "").strip() or "acp://gemini-cli"
-    else:
-        command = (
-            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-            or os.getenv("COPILOT_CLI_PATH", "").strip()
-            or "copilot"
-        )
-        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-        base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-        if not base_url:
-            base_url = pconfig.inference_base_url
+    command = (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if not base_url:
+        base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
     return {
@@ -2524,12 +2533,10 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_codex_auth_status()
     if target == "qwen-oauth":
         return get_qwen_auth_status()
+    if target == "google-gemini-cli":
+        return get_gemini_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
-    if target == "google-gemini-cli":
-        status = get_external_process_provider_status(target)
-        if status.get("configured"):
-            return status
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -2584,33 +2591,6 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
-    if provider_id == "google-gemini-cli":
-        command = (
-            os.getenv("HERMES_GEMINI_ACP_COMMAND", "").strip()
-            or os.getenv("GEMINI_CLI_PATH", "").strip()
-            or "gemini"
-        )
-        raw_args = os.getenv("HERMES_GEMINI_ACP_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["--acp"]
-        base_url = os.getenv("GEMINI_ACP_BASE_URL", "").strip() or "acp://gemini-cli"
-        resolved_command = shutil.which(command) if command else None
-        if not resolved_command and not base_url.startswith("acp+tcp://"):
-            raise AuthError(
-                f"Could not find the Gemini CLI command '{command}'. "
-                "Install `gemini` or set HERMES_GEMINI_ACP_COMMAND/GEMINI_CLI_PATH.",
-                provider=provider_id,
-                code="missing_gemini_cli",
-            )
-
-        return {
-            "provider": provider_id,
-            "api_key": "gemini-cli-acp",
-            "base_url": base_url.rstrip("/"),
-            "command": resolved_command or command,
-            "args": args,
-            "source": "process",
-        }
-
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         raise AuthError(

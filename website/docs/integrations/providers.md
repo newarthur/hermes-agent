@@ -35,6 +35,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
 | **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
 | **Google / Gemini** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `~/.hermes/.env` (provider: `gemini`) |
+| **Google Gemini CLI** | OAuth PKCE via `hermes model` (provider: `google-gemini-cli`) |
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
 :::tip Model key alias
@@ -229,6 +230,54 @@ Get your token at [huggingface.co/settings/tokens](https://huggingface.co/settin
 You can append routing suffixes to model names: `:fastest` (default), `:cheapest`, or `:provider_name` to force a specific backend.
 
 The base URL can be overridden with `HF_BASE_URL`.
+
+### Google / Gemini (API Key)
+
+Use Google AI Studio's Gemini models directly with an API key. This is the simplest way to use Gemini if you already have a key from [Google AI Studio](https://aistudio.google.com/app/apikey).
+
+```bash
+# Set either env var in ~/.hermes/.env
+export GOOGLE_API_KEY=your-key
+# or
+export GEMINI_API_KEY=your-key
+
+hermes chat --provider gemini --model gemini-2.5-pro
+```
+
+Or set it permanently in `config.yaml`:
+```yaml
+model:
+  provider: "gemini"
+  default: "gemini-2.5-pro"
+```
+
+The base URL can be overridden with `GEMINI_BASE_URL`.
+
+### Google Gemini CLI (OAuth)
+
+Authenticate with Gemini via **OAuth PKCE** instead of copying an API key. This provider (`google-gemini-cli`) uses your Google account directly and stores refreshable credentials under `~/.hermes/auth/google_oauth.json`.
+
+```bash
+hermes model
+# → select "Google Gemini CLI"
+```
+
+Hermes will open your browser for authorization and start a temporary localhost callback server on `http://localhost:8085`. If you're on a remote or headless machine, you can paste the callback URL or authorization code manually.
+
+:::caution OAuth Client ID required
+Hermes does **not** ship with a built-in Google OAuth client ID. To use the OAuth flow, register a **Desktop app** OAuth client in [Google Cloud Console](https://console.cloud.google.com/apis/credentials), enable the **Generative Language API**, and set the client ID before running `hermes model`:
+
+```bash
+export HERMES_GEMINI_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+export HERMES_GEMINI_CLIENT_SECRET="your-client-secret"  # optional for desktop apps
+```
+:::
+
+| Environment variable | Description |
+|---------------------|-------------|
+| `HERMES_GEMINI_CLIENT_ID` | Google OAuth client ID for the PKCE flow |
+| `HERMES_GEMINI_CLIENT_SECRET` | Optional client secret (desktop apps may omit) |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Fallback API key if OAuth is not configured |
 
 ## Custom & Self-Hosted LLM Providers
 

@@ -33,7 +33,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"nous", "openai-codex", "google-gemini-cli", "qwen-oauth"}
+_OAUTH_CAPABLE_PROVIDERS={"openai-codex", "google-gemini-cli", "qwen-oauth"}
 
 
 def _get_custom_provider_names() -> list:
@@ -148,7 +148,7 @@ def auth_add_command(args) -> None:
         if provider.startswith(CUSTOM_POOL_PREFIX):
             requested_type = AUTH_TYPE_API_KEY
         else:
-            requested_type = AUTH_TYPE_OAUTH if provider in {"anthropic", "nous", "openai-codex", "qwen-oauth"} else AUTH_TYPE_API_KEY
+            requested_type = AUTH_TYPE_OAUTH if provider in {"anthropic", "nous", "openai-codex", "qwen-oauth", "google-gemini-cli"} else AUTH_TYPE_API_KEY
 
     pool = load_pool(provider)
 
@@ -274,6 +274,16 @@ def auth_add_command(args) -> None:
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
+    if provider in {"google-gemini-cli"}:
+        from agent import google_oauth
+        creds = google_oauth.start_oauth_flow(
+            open_browser=not getattr(args, "no_browser", False),
+        )
+        if not creds:
+            raise SystemExit("Gemini OAuth login did not return credentials.")
+        print("Gemini OAuth credentials saved successfully.")
+        return
+
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
 
 
@@ -290,18 +300,26 @@ def auth_list_command(args) -> None:
     for provider in providers:
         pool = load_pool(provider)
         entries = pool.entries()
-        if not entries:
-            continue
-        current = pool.peek()
-        print(f"{provider} ({len(entries)} credentials):")
-        for idx, entry in enumerate(entries, start=1):
-            marker = "  "
-            if current is not None and entry.id == current.id:
-                marker = "← "
-            status = _format_exhausted_status(entry)
-            source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
-        print()
+        if entries:
+            current = pool.peek()
+            print(f"{provider} ({len(entries)} credentials):")
+            for idx, entry in enumerate(entries, start=1):
+                marker = "  "
+                if current is not None and entry.id == current.id:
+                    marker = "← "
+                status = _format_exhausted_status(entry)
+                source = _display_source(entry.source)
+                print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            print()
+        elif provider in {"google-gemini-cli"}:
+            from agent import google_oauth
+            info = google_oauth.load_credentials()
+            if info:
+                email = info.get("email") or "unknown"
+                print(f"{provider} (1 OAuth credential):")
+                print(f"  #1  {email:<20} oauth    gemini_oauth  ← ")
+                print()
+
 
 
 def auth_remove_command(args) -> None:
@@ -309,6 +327,17 @@ def auth_remove_command(args) -> None:
     target = getattr(args, "target", None)
     if target is None:
         target = getattr(args, "index", None)
+
+    # Gemini OAuth credentials are file-based, not stored in the credential pool.
+    if provider in {"google-gemini-cli"}:
+        from agent import google_oauth
+        cleared = google_oauth.clear_credentials()
+        if cleared:
+            print("Cleared Gemini OAuth credentials")
+        else:
+            print("No Gemini OAuth credentials to remove")
+        return
+
     pool = load_pool(provider)
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:
@@ -481,6 +510,24 @@ def _interactive_add() -> None:
 def _interactive_remove() -> None:
     provider = _pick_provider("Provider to remove credential from")
     pool = load_pool(provider)
+
+    # Gemini OAuth is file-based, not in the credential pool
+    if provider in {"google-gemini-cli"}:
+        from agent import google_oauth
+        info = google_oauth.load_credentials()
+        if not info:
+            print(f"No credentials for {provider}.")
+            return
+        email = info.get("email") or "unknown"
+        print(f"  #1  {email:25s} oauth      gemini_oauth")
+        try:
+            raw = input("Remove #1 (blank to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if raw == "1":
+            auth_remove_command(SimpleNamespace(provider=provider, target=raw))
+        return
+
     if not pool.has_credentials():
         print(f"No credentials for {provider}.")
         return

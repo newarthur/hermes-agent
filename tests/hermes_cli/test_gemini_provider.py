@@ -88,7 +88,27 @@ class TestGeminiAutoDetection:
         monkeypatch.setenv("GEMINI_API_KEY", "alias-key")
         creds = resolve_api_key_provider_credentials("gemini")
         assert creds["api_key"] == "primary-key"
-        assert creds["source"] == "GOOGLE_API_KEY"
+        assert creds["source"] == "env:GOOGLE_API_KEY"
+
+
+# ── Auto-detection ──
+
+class TestGeminiAutoDetection:
+    def test_auto_detects_google_api_key(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        assert resolve_provider("auto") == "gemini"
+
+    def test_auto_detects_gemini_api_key(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        assert resolve_provider("auto") == "gemini"
+
+    def test_google_api_key_priority_over_gemini(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "primary-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "alias-key")
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        result = resolve_runtime_provider(requested="gemini")
+        assert result["api_key"] == "primary-key"
+        assert result["source"] == "env:GOOGLE_API_KEY"
 
 
 # ── Credential Resolution ──
@@ -96,21 +116,24 @@ class TestGeminiAutoDetection:
 class TestGeminiCredentials:
     def test_resolve_with_google_api_key(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
-        creds = resolve_api_key_provider_credentials("gemini")
-        assert creds["provider"] == "gemini"
-        assert creds["api_key"] == "google-secret"
-        assert creds["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        result = resolve_runtime_provider(requested="gemini")
+        assert result["provider"] == "gemini"
+        assert result["api_key"] == "google-secret"
+        assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
 
     def test_resolve_with_gemini_api_key(self, monkeypatch):
         monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
-        creds = resolve_api_key_provider_credentials("gemini")
-        assert creds["api_key"] == "gemini-secret"
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        result = resolve_runtime_provider(requested="gemini")
+        assert result["api_key"] == "gemini-secret"
 
     def test_resolve_with_custom_base_url(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setenv("GEMINI_BASE_URL", "https://custom.endpoint/v1")
-        creds = resolve_api_key_provider_credentials("gemini")
-        assert creds["base_url"] == "https://custom.endpoint/v1"
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        result = resolve_runtime_provider(requested="gemini")
+        assert result["base_url"] == "https://custom.endpoint/v1"
 
     def test_runtime_gemini(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "google-key")

@@ -57,6 +57,7 @@ _stale_base_url_warned = False
 _PROVIDER_ALIASES = {
     "google": "gemini",
     "google-gemini": "gemini",
+    "google-gemini-cli": "gemini",
     "google-ai-studio": "gemini",
     "x-ai": "xai",
     "x.ai": "xai",

@@ -1137,6 +1137,8 @@ def select_provider_and_model(args=None):
         _remove_custom_provider(config)
     elif selected_provider == "anthropic":
         _model_flow_anthropic(config, current_model)
+    elif selected_provider == "google-gemini-cli":
+        _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
     elif selected_provider == "bedrock":
@@ -2917,6 +2919,77 @@ def _run_anthropic_oauth_flow(save_env_value):
             return True
         print("  Cancelled — install Claude Code and try again.")
         return False
+
+
+def _model_flow_google_gemini_cli(config, current_model=""):
+    """Flow for Google Gemini CLI provider — OAuth PKCE login."""
+    from hermes_cli.auth import (
+        _prompt_model_selection, _save_model_choice,
+        deactivate_provider,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import _PROVIDER_MODELS
+    from agent import google_oauth
+
+    creds = google_oauth.load_credentials()
+    has_creds = bool(creds and creds.get("access_token"))
+    needs_auth = not has_creds
+
+    if has_creds:
+        email = creds.get("email") or "unknown"
+        print(f"  Gemini OAuth credentials: {email} ✓")
+        print()
+        print("    1. Use existing credentials")
+        print("    2. Reauthenticate (new OAuth login)")
+        print("    3. Cancel")
+        print()
+        try:
+            choice = input("  Choice [1/2/3]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            choice = "1"
+
+        if choice == "2":
+            needs_auth = True
+        elif choice == "3":
+            return
+        # choice == "1" or default: use existing, proceed to model selection
+
+    if needs_auth:
+        new_creds = google_oauth.start_oauth_flow(open_browser=True)
+        if not new_creds:
+            print("  OAuth login cancelled or failed.")
+            return
+        print("  ✓ Gemini OAuth credentials saved.")
+
+    print()
+
+    # Model selection
+    model_list = _PROVIDER_MODELS.get("google-gemini-cli", [])
+    if model_list:
+        selected = _prompt_model_selection(model_list, current_model=current_model)
+    else:
+        try:
+            selected = input("Model name (e.g., gemini-2.5-pro): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if selected:
+        _save_model_choice(selected)
+
+        cfg = load_config()
+        model = cfg.get("model")
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = "google-gemini-cli"
+        model.pop("base_url", None)
+        model.pop("api_mode", None)
+        save_config(cfg)
+        deactivate_provider()
+
+        print(f"Default model set to: {selected} (via Google Gemini CLI)")
+    else:
+        print("No change.")
 
 
 def _model_flow_anthropic(config, current_model=""):

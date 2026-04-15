@@ -922,6 +922,25 @@ def _claude_code_only_status() -> Dict[str, Any]:
     return {"logged_in": False, "source": None}
 
 
+def _gemini_oauth_status() -> Dict[str, Any]:
+    """Return the current Google Gemini CLI OAuth status."""
+    try:
+        from agent import google_oauth
+        creds = google_oauth.load_credentials()
+    except Exception:
+        creds = None
+    if creds and creds.get("access_token"):
+        return {
+            "logged_in": True,
+            "source": "gemini_oauth_file",
+            "source_label": "Hermes-managed Gemini OAuth",
+            "token_preview": _truncate_token(creds.get("access_token")),
+            "expires_at": creds.get("expires_at"),
+            "has_refresh_token": bool(creds.get("refresh_token")),
+        }
+    return {"logged_in": False, "source": None}
+
+
 # Provider catalog. The order matters — it's how we render the UI list.
 # ``cli_command`` is what the dashboard surfaces as the copy-to-clipboard
 # fallback while Phase 2 (in-browser flows) isn't built yet.
@@ -945,6 +964,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "claude setup-token",
         "docs_url": "https://docs.claude.com/en/docs/claude-code",
         "status_fn": _claude_code_only_status,
+    },
+    {
+        "id": "google-gemini-cli",
+        "name": "Google Gemini CLI",
+        "flow": "pkce",
+        "cli_command": "hermes auth add google-gemini-cli",
+        "docs_url": "https://ai.google.dev/gemini-api/docs/oauth",
+        "status_fn": _gemini_oauth_status,
     },
     {
         "id": "nous",
