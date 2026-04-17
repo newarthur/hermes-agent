@@ -28,6 +28,22 @@ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.D
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
 
+def _coerce_timeout_seconds(timeout: Any) -> float:
+    if timeout is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    if isinstance(timeout, bool):
+        return float(timeout or _DEFAULT_TIMEOUT_SECONDS)
+    if isinstance(timeout, (int, float)):
+        return float(timeout or _DEFAULT_TIMEOUT_SECONDS)
+    for attr in ("read", "timeout", "total"):
+        value = getattr(timeout, attr, None)
+        if isinstance(value, bool):
+            return float(value or _DEFAULT_TIMEOUT_SECONDS)
+        if isinstance(value, (int, float)):
+            return float(value or _DEFAULT_TIMEOUT_SECONDS)
+    return _DEFAULT_TIMEOUT_SECONDS
+
+
 def _resolve_command() -> str:
     return (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
@@ -315,7 +331,7 @@ class CopilotACPClient:
         )
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
-            timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS),
+            timeout_seconds=_coerce_timeout_seconds(timeout),
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)

@@ -37,6 +37,7 @@ class TestProviderRegistry:
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("google-gemini-cli", "Google Gemini CLI", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
@@ -103,6 +104,7 @@ class TestProviderRegistry:
     def test_base_urls(self):
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
+        assert PROVIDER_REGISTRY["google-gemini-cli"].inference_base_url == "acp://gemini-cli"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
         assert PROVIDER_REGISTRY["minimax"].inference_base_url == "https://api.minimax.io/anthropic"
@@ -345,37 +347,24 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
-    def test_google_gemini_cli_status_with_oauth(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.auth.resolve_gemini_runtime_credentials",
-            lambda refresh_if_expiring=True: {
-                "api_key": "oauth-token",
-                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-                "source": "google-oauth-pkce",
-            },
-        )
+    def test_google_gemini_cli_status_uses_external_process(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/opt/bin/{command}")
 
         status = get_auth_status("google-gemini-cli")
 
+        assert status["configured"] is True
         assert status["logged_in"] is True
-        assert status["source"] == "google-oauth-pkce"
-        assert status["api_key"] == "oauth-token"
+        assert status["resolved_command"] == "/opt/bin/gemini"
+        assert status["base_url"] == "acp://gemini-cli"
+        assert status["args"] == ["--acp"]
 
-    def test_google_gemini_cli_status_falls_back_to_api_key(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
-        monkeypatch.setattr(
-            "hermes_cli.auth.resolve_gemini_runtime_credentials",
-            lambda refresh_if_expiring=True: (_ for _ in ()).throw(
-                AuthError("No OAuth credentials", provider="google-gemini-cli")
-            ),
-        )
+    def test_google_gemini_cli_status_reports_missing_cli(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
 
         status = get_auth_status("google-gemini-cli")
 
-        # get_auth_status dispatches to get_gemini_auth_status which only checks OAuth;
-        # when OAuth fails it returns logged_in=False even if API key env var is present.
         assert status["logged_in"] is False
-        assert "error" in status
+        assert status["configured"] is False
 
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
@@ -452,17 +441,18 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
 
-    def test_resolve_google_gemini_cli_with_api_key_fallback(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "google-secret-key")
+    def test_resolve_google_gemini_cli_with_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GEMINI_ACP_ARGS", "--acp --debug")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
 
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
-        creds = resolve_runtime_provider(requested="google-gemini-cli")
+        creds = resolve_external_process_provider_credentials("google-gemini-cli")
 
         assert creds["provider"] == "google-gemini-cli"
-        assert creds["api_key"] == "google-secret-key"
-        assert creds["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
-        assert creds["source"] == "GOOGLE_API_KEY"
+        assert creds["api_key"] == "***"
+        assert creds["base_url"] == "acp://gemini-cli"
+        assert creds["command"] == "/usr/local/bin/gemini"
+        assert creds["args"] == ["--acp", "--debug"]
+        assert creds["source"] == "process"
 
     def test_resolve_kimi_with_key(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-secret-key")
@@ -640,8 +630,9 @@ class TestRuntimeProviderResolution:
         assert result["command"] == "/usr/local/bin/copilot"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
 
-    def test_runtime_google_gemini_cli_uses_api_key_fallback(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "google-secret-key")
+    def test_runtime_google_gemini_cli_uses_external_process(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GEMINI_ACP_ARGS", "--acp")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -649,8 +640,10 @@ class TestRuntimeProviderResolution:
 
         assert result["provider"] == "google-gemini-cli"
         assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "google-secret-key"
-        assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+        assert result["api_key"] == "***"
+        assert result["base_url"] == "acp://gemini-cli"
+        assert result["command"] == "/usr/local/bin/gemini"
+        assert result["args"] == ["--acp"]
 
 
 # =============================================================================

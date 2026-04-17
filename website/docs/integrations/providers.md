@@ -255,29 +255,25 @@ The base URL can be overridden with `GEMINI_BASE_URL`.
 
 ### Google Gemini CLI (OAuth)
 
-Authenticate with Gemini via **OAuth PKCE** instead of copying an API key. This provider (`google-gemini-cli`) uses your Google account directly and stores refreshable credentials under `~/.hermes/auth/google_oauth.json`.
+Authenticate with Gemini via the **local Gemini CLI** instead of copying an API key. This provider (`google-gemini-cli`) reuses your existing Gemini CLI Google login and talks to the local ACP bridge (`gemini --acp`) rather than storing Hermes-managed OAuth tokens.
 
 ```bash
+# First complete Google sign-in in the official Gemini CLI
+gemini
+
+# Then select the provider in Hermes
 hermes model
 # → select "Google Gemini CLI"
 ```
 
-Hermes will open your browser for authorization and start a temporary localhost callback server on `http://localhost:8085`. If you're on a remote or headless machine, you can paste the callback URL or authorization code manually.
-
-:::caution OAuth Client ID required
-Hermes does **not** ship with a built-in Google OAuth client ID. To use the OAuth flow, register a **Desktop app** OAuth client in [Google Cloud Console](https://console.cloud.google.com/apis/credentials), enable the **Generative Language API**, and set the client ID before running `hermes model`:
-
-```bash
-export HERMES_GEMINI_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export HERMES_GEMINI_CLIENT_SECRET="your-client-secret"  # optional for desktop apps
-```
-:::
+Hermes resolves the local CLI command from `HERMES_GEMINI_ACP_COMMAND`, `GEMINI_CLI_PATH`, or `gemini` on `$PATH`, and defaults to ACP args `--acp`.
 
 | Environment variable | Description |
 |---------------------|-------------|
-| `HERMES_GEMINI_CLIENT_ID` | Google OAuth client ID for the PKCE flow |
-| `HERMES_GEMINI_CLIENT_SECRET` | Optional client secret (desktop apps may omit) |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Fallback API key if OAuth is not configured |
+| `HERMES_GEMINI_ACP_COMMAND` | Override the Gemini CLI command Hermes launches for ACP |
+| `GEMINI_CLI_PATH` | Alternate path to the Gemini CLI binary |
+| `HERMES_GEMINI_ACP_ARGS` | Override ACP args (default: `--acp`) |
+| `GEMINI_ACP_BASE_URL` | Override the ACP marker/base URL (default: `acp://gemini-cli`) |
 
 ## Custom & Self-Hosted LLM Providers
 

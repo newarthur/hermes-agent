@@ -1244,6 +1244,37 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 },
             )
 
+    elif provider == "google-gemini-cli":
+        try:
+            from agent import google_oauth
+
+            creds = google_oauth.load_credentials()
+            if creds:
+                source_name = "gemini_oauth"
+                active_sources.add(source_name)
+                pconfig = PROVIDER_REGISTRY.get(provider)
+                base_url = (
+                    pconfig.inference_base_url
+                    if pconfig
+                    else "https://generativelanguage.googleapis.com/v1beta/openai"
+                )
+                changed |= _upsert_entry(
+                    entries,
+                    provider,
+                    source_name,
+                    {
+                        "source": source_name,
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": creds.get("access_token", ""),
+                        "refresh_token": creds.get("refresh_token"),
+                        "expires_at": creds.get("expires_at"),
+                        "base_url": base_url,
+                        "label": creds.get("email") or "Gemini OAuth",
+                    },
+                )
+        except Exception as exc:
+            logger.debug("Gemini OAuth token seed failed: %s", exc)
+
     return changed, active_sources
 
 

@@ -64,7 +64,7 @@ hermes setup       # Or configure everything at once
 | **GitHub Copilot** | GitHub Copilot subscription (GPT-5.x, Claude, Gemini, etc.) | OAuth via `hermes model`, or `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` |
 | **GitHub Copilot ACP** | Copilot ACP agent backend (spawns local `copilot` CLI) | `hermes model` (requires `copilot` CLI + `copilot login`) |
 | **Google / Gemini** | Google AI Studio Gemini models | Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| **Google Gemini CLI** | Gemini via OAuth PKCE (no API key needed) | `hermes model` → "Google Gemini CLI" (requires `HERMES_GEMINI_CLIENT_ID`) |
+| **Google Gemini CLI** | Gemini via local Gemini CLI OAuth (ACP bridge, no API key needed) | `gemini` (sign in once) then `hermes model` → "Google Gemini CLI" |
 | **Vercel AI Gateway** | Vercel AI Gateway routing | Set `AI_GATEWAY_API_KEY` |
 | **Custom Endpoint** | VLLM, SGLang, Ollama, or any OpenAI-compatible API | Set base URL + API key |
 

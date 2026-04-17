@@ -148,10 +148,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "google-gemini-cli": ProviderConfig(
         id="google-gemini-cli",
         name="Google Gemini CLI",
-        auth_type="oauth_google",
-        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
-        base_url_env_var="GEMINI_BASE_URL",
+        auth_type="external_process",
+        inference_base_url="acp://gemini-cli",
+        base_url_env_var="GEMINI_ACP_BASE_URL",
     ),
     "zai": ProviderConfig(
         id="zai",
@@ -2500,13 +2499,22 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "google-gemini-cli":
+        command = (
+            os.getenv("HERMES_GEMINI_ACP_COMMAND", "").strip()
+            or os.getenv("GEMINI_CLI_PATH", "").strip()
+            or "gemini"
+        )
+        raw_args = os.getenv("HERMES_GEMINI_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp"]
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -2533,9 +2541,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_codex_auth_status()
     if target == "qwen-oauth":
         return get_qwen_auth_status()
-    if target == "google-gemini-cli":
-        return get_gemini_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "google-gemini-cli"}:
         return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
@@ -2603,15 +2609,31 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "google-gemini-cli":
+        command = (
+            os.getenv("HERMES_GEMINI_ACP_COMMAND", "").strip()
+            or os.getenv("GEMINI_CLI_PATH", "").strip()
+            or "gemini"
+        )
+        raw_args = os.getenv("HERMES_GEMINI_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp"]
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        if provider_id == "google-gemini-cli":
+            raise AuthError(
+                f"Could not find the Gemini CLI command '{command}'. "
+                "Install Google Gemini CLI or set HERMES_GEMINI_ACP_COMMAND/GEMINI_CLI_PATH.",
+                provider=provider_id,
+                code="missing_gemini_cli",
+            )
         raise AuthError(
             f"Could not find the Copilot CLI command '{command}'. "
             "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",

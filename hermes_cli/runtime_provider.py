@@ -23,7 +23,6 @@ from hermes_cli.auth import (
     resolve_nous_runtime_credentials,
     resolve_codex_runtime_credentials,
     resolve_qwen_runtime_credentials,
-    resolve_gemini_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
@@ -158,6 +157,8 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
+    elif provider == "google-gemini-cli":
+        base_url = base_url or "acp://gemini-cli"
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -864,65 +865,17 @@ def resolve_runtime_provider(
         }
 
     if provider == "google-gemini-cli":
-        # Prefer OAuth PKCE credentials; fall back to legacy API key env vars.
-        oauth_creds = None
-        try:
-            oauth_creds = resolve_gemini_runtime_credentials()
-        except Exception:
-            pass
-        if oauth_creds:
-            return {
-                "provider": "google-gemini-cli",
-                "api_mode": "chat_completions",
-                "base_url": oauth_creds.get("base_url", "").rstrip("/"),
-                "api_key": oauth_creds.get("api_key", ""),
-                "source": oauth_creds.get("source", "google-oauth-pkce"),
-                "requested_provider": requested_provider,
-            }
-        # Fallback to API key env vars (legacy path)
-        pconfig = PROVIDER_REGISTRY.get("google-gemini-cli")
-        api_key = ""
-        key_source = "env"
-        if pconfig:
-            for env_var in pconfig.api_key_env_vars:
-                val = os.getenv(env_var, "").strip()
-                if val:
-                    api_key = val
-                    key_source = env_var
-                    break
-        if not api_key:
-            api_key = (
-                os.getenv("GEMINI_API_KEY", "").strip()
-                or os.getenv("GOOGLE_API_KEY", "").strip()
-            )
-            if api_key:
-                key_source = "env"
-        if api_key:
-            base_url = (
-                os.getenv("GEMINI_BASE_URL", "").strip().rstrip("/")
-                or (
-                    pconfig.inference_base_url
-                    if pconfig
-                    else "https://generativelanguage.googleapis.com/v1beta/openai"
-                )
-            )
-            return {
-                "provider": "google-gemini-cli",
-                "api_mode": "chat_completions",
-                "base_url": base_url.rstrip("/"),
-                "api_key": api_key,
-                "source": key_source,
-                "requested_provider": requested_provider,
-            }
-        if requested_provider != "auto":
-            raise AuthError(
-                "No Gemini OAuth credentials found. Run `hermes auth add google-gemini-cli` to authenticate, "
-                "or set GEMINI_API_KEY / GOOGLE_API_KEY.",
-                provider="google-gemini-cli",
-                code="google_gemini_cli_auth_missing",
-                relogin_required=True,
-            )
-        logger.info("Google Gemini CLI OAuth credentials missing and no API key set; falling through to next provider.")
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": "google-gemini-cli",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

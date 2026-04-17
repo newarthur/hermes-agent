@@ -5362,6 +5362,22 @@ class AIAgent:
             import httpx as _httpx
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
             _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            if self.provider in {"copilot-acp", "google-gemini-cli"} or str(self.base_url).startswith("acp://"):
+                request_client_holder["client"] = self._create_request_openai_client(
+                    reason="chat_completion_acp_request"
+                )
+                self._touch_activity("waiting for provider response (acp)")
+                acp_kwargs = dict(api_kwargs)
+                acp_kwargs.setdefault(
+                    "timeout",
+                    _httpx.Timeout(
+                        connect=30.0,
+                        read=_base_timeout,
+                        write=_base_timeout,
+                        pool=30.0,
+                    ),
+                )
+                return request_client_holder["client"].chat.completions.create(**acp_kwargs)
             # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly

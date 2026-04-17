@@ -550,14 +550,14 @@ def _rewrite_natural_personality_switch(text: str) -> str:
         "切到主助理": "hermes_main",
         "切通用": "hermes_main",
         "切到通用": "hermes_main",
-        "切科研": "osahs_research",
-        "切到科研": "osahs_research",
-        "科研模式": "osahs_research",
-        "学术模式": "osahs_research",
-        "切运维": "openclaw_ops",
-        "切到运维": "openclaw_ops",
-        "运维模式": "openclaw_ops",
-        "系统模式": "openclaw_ops",
+        "切科研": "hermes_osahs",
+        "切到科研": "hermes_osahs",
+        "科研模式": "hermes_osahs",
+        "学术模式": "hermes_osahs",
+        "切运维": "hermes_ops",
+        "切到运维": "hermes_ops",
+        "运维模式": "hermes_ops",
+        "系统模式": "hermes_ops",
     }
     personality = mapping.get(normalized)
     return f"/personality {personality}" if personality else raw

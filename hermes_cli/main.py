@@ -2922,74 +2922,70 @@ def _run_anthropic_oauth_flow(save_env_value):
 
 
 def _model_flow_google_gemini_cli(config, current_model=""):
-    """Flow for Google Gemini CLI provider — OAuth PKCE login."""
+    """Flow for Google Gemini CLI provider via the local Gemini CLI ACP bridge."""
     from hermes_cli.auth import (
-        _prompt_model_selection, _save_model_choice,
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
         deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
     )
     from hermes_cli.config import load_config, save_config
     from hermes_cli.models import _PROVIDER_MODELS
-    from agent import google_oauth
 
-    creds = google_oauth.load_credentials()
-    has_creds = bool(creds and creds.get("access_token"))
-    needs_auth = not has_creds
+    del config
 
-    if has_creds:
-        email = creds.get("email") or "unknown"
-        print(f"  Gemini OAuth credentials: {email} ✓")
-        print()
-        print("    1. Use existing credentials")
-        print("    2. Reauthenticate (new OAuth login)")
-        print("    3. Cancel")
-        print()
-        try:
-            choice = input("  Choice [1/2/3]: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            choice = "1"
+    provider_id = "google-gemini-cli"
+    pconfig = PROVIDER_REGISTRY[provider_id]
 
-        if choice == "2":
-            needs_auth = True
-        elif choice == "3":
-            return
-        # choice == "1" or default: use existing, proceed to model selection
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = status.get("resolved_command") or status.get("command") or "gemini"
+    effective_base = status.get("base_url") or pconfig.inference_base_url
 
-    if needs_auth:
-        new_creds = google_oauth.start_oauth_flow(open_browser=True)
-        if not new_creds:
-            print("  OAuth login cancelled or failed.")
-            return
-        print("  ✓ Gemini OAuth credentials saved.")
-
+    print("  Google Gemini CLI delegates Hermes turns to the local `gemini --acp` process.")
+    print("  This uses your existing Gemini CLI Google login (membership / OAuth), not AI Studio API keys.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
     print()
 
-    # Model selection
-    model_list = _PROVIDER_MODELS.get("google-gemini-cli", [])
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print("  Set HERMES_GEMINI_ACP_COMMAND or GEMINI_CLI_PATH if Gemini CLI is installed elsewhere.")
+        print("  Then run `gemini` directly once to complete Google sign-in if needed.")
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+
+    model_list = _PROVIDER_MODELS.get(provider_id, [])
     if model_list:
         selected = _prompt_model_selection(model_list, current_model=current_model)
     else:
         try:
-            selected = input("Model name (e.g., gemini-2.5-pro): ").strip()
+            selected = input("Model name (e.g., gemini-3.1-pro-preview): ").strip()
         except (KeyboardInterrupt, EOFError):
             selected = None
 
-    if selected:
-        _save_model_choice(selected)
-
-        cfg = load_config()
-        model = cfg.get("model")
-        if not isinstance(model, dict):
-            model = {"default": model} if model else {}
-            cfg["model"] = model
-        model["provider"] = "google-gemini-cli"
-        model.pop("base_url", None)
-        model.pop("api_mode", None)
-        save_config(cfg)
-        deactivate_provider()
-
-        print(f"Default model set to: {selected} (via Google Gemini CLI)")
-    else:
+    if not selected:
         print("No change.")
+        return
+
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
 def _model_flow_anthropic(config, current_model=""):
