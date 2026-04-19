@@ -2,6 +2,9 @@ name: Temp PR Validation
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - fix/local-provider-routing-patches-20260419
 
 permissions:
   contents: read
