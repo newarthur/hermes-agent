@@ -76,6 +76,7 @@ AUTHOR_MAP = {
     "39405770+yyq4193@users.noreply.github.com": "yyq4193",
     "Asunfly@users.noreply.github.com": "Asunfly",
     "2500400+honghua@users.noreply.github.com": "honghua",
+    "kimsr96@users.noreply.github.com": "kimsr96",
     # contributors (manual mapping from git names)
     "ahmedsherif95@gmail.com": "asheriif",
     "liujinkun@bytedance.com": "liujinkun2025",
