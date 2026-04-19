@@ -1,0 +1,51 @@
+name: Temp PR Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-pr-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  targeted-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run targeted regression tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/agent/test_auxiliary_client.py \
+            tests/cli/test_personality_none.py \
+            tests/hermes_cli/test_user_providers_model_switch.py \
+            tests/run_agent/test_run_agent.py \
+            -q
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Check whitespace / patch hygiene
+        run: git diff --check main...HEAD
