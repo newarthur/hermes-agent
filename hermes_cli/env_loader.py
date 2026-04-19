@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -87,6 +87,25 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
                 raise
     except Exception:
         pass  # best-effort — don't block gateway startup
+
+
+def read_hermes_env_value(
+    name: str,
+    *,
+    hermes_home: str | os.PathLike | None = None,
+) -> str:
+    """Read a single env var directly from ~/.hermes/.env without trusting process env."""
+    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    user_env = home_path / ".env"
+    if not user_env.exists():
+        return ""
+    _sanitize_env_file_if_needed(user_env)
+    try:
+        values = dotenv_values(user_env, encoding="utf-8")
+    except UnicodeDecodeError:
+        values = dotenv_values(user_env, encoding="latin-1")
+    value = values.get(name)
+    return str(value or "").strip()
 
 
 def load_hermes_dotenv(

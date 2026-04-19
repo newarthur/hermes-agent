@@ -811,9 +811,18 @@ def list_authenticated_providers(
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
 
+    from hermes_cli.providers import normalize_provider
+
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
+
+    def _mark_seen(*slugs: str) -> None:
+        for slug in slugs:
+            if not slug:
+                continue
+            seen_slugs.add(slug.lower())
+            seen_slugs.add(normalize_provider(slug).lower())
 
     data = fetch_models_dev()
 
@@ -851,13 +860,22 @@ def list_authenticated_providers(
                 continue
 
         # Check if any env var is set
-        has_creds = any(os.environ.get(ev) for ev in env_vars)
+        if hermes_id in ("kimi-coding", "kimi-coding-cn"):
+            from hermes_cli.env_loader import read_hermes_env_value
+            has_creds = any(read_hermes_env_value(ev) for ev in env_vars)
+        else:
+            has_creds = any(os.environ.get(ev) for ev in env_vars)
         if not has_creds:
             continue
 
-        # Use curated list, falling back to models.dev if no curated list
+        # Use curated list, falling back to models.dev if no curated list.
+        # Skip providers that authenticate successfully but have no curated
+        # switchable models; otherwise Telegram/Discord show dead rows like
+        # "OpenAI (0)" that cannot lead to any model selection.
         model_ids = curated.get(hermes_id, [])
         total = len(model_ids)
+        if total <= 0:
+            continue
         top = model_ids[:max_models]
 
         slug = hermes_id
@@ -873,7 +891,7 @@ def list_authenticated_providers(
             "total_models": total,
             "source": "built-in",
         })
-        seen_slugs.add(slug.lower())
+        _mark_seen(slug)
         seen_mdev_ids.add(mdev_id)
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot, opencode-go) ---
@@ -897,13 +915,22 @@ def list_authenticated_providers(
         # Check if credentials exist
         has_creds = False
         if overlay.extra_env_vars:
-            has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
+            if hermes_slug in ("kimi-coding", "kimi-coding-cn"):
+                from hermes_cli.env_loader import read_hermes_env_value
+                has_creds = any(read_hermes_env_value(ev) for ev in overlay.extra_env_vars)
+            else:
+                has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
                 pcfg = _auth_registry.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
-                    if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
+                    if _key in ("kimi-coding", "kimi-coding-cn"):
+                        from hermes_cli.env_loader import read_hermes_env_value
+                        if any(read_hermes_env_value(ev) for ev in pcfg.api_key_env_vars):
+                            has_creds = True
+                            break
+                    elif any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
         # Check auth store and credential pool for non-env-var credentials.
@@ -958,9 +985,13 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        # Use curated list — look up by Hermes slug, fall back to overlay key
+        # Use curated list — look up by Hermes slug, fall back to overlay key.
+        # Hide authenticated providers that currently have no curated picker
+        # entries so the gateway does not render empty provider rows.
         model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
         total = len(model_ids)
+        if total <= 0:
+            continue
         top = model_ids[:max_models]
 
         results.append({
@@ -972,8 +1003,7 @@ def list_authenticated_providers(
             "total_models": total,
             "source": "hermes",
         })
-        seen_slugs.add(pid.lower())
-        seen_slugs.add(hermes_slug.lower())
+        _mark_seen(pid, hermes_slug)
 
     # --- 2b. Cross-check canonical provider list ---
     # Catches providers that are in CANONICAL_PROVIDERS but weren't found
@@ -992,7 +1022,11 @@ def list_authenticated_providers(
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
-            _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
+            if _cp.slug in ("kimi-coding", "kimi-coding-cn"):
+                from hermes_cli.env_loader import read_hermes_env_value
+                _cp_has_creds = any(read_hermes_env_value(ev) for ev in _cp_config.api_key_env_vars)
+            else:
+                _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:
             try:
@@ -1021,6 +1055,8 @@ def list_authenticated_providers(
 
         _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
+        if _cp_total <= 0:
+            continue
         _cp_top = _cp_model_ids[:max_models]
 
         results.append({
@@ -1032,13 +1068,25 @@ def list_authenticated_providers(
             "total_models": _cp_total,
             "source": "canonical",
         })
-        seen_slugs.add(_cp.slug.lower())
+        _mark_seen(_cp.slug)
 
     # --- 3. User-defined endpoints from config ---
     if user_providers and isinstance(user_providers, dict):
+        from hermes_cli.providers import normalize_provider
+
         for ep_name, ep_cfg in user_providers.items():
             if not isinstance(ep_cfg, dict):
                 continue
+
+            slug = normalize_provider(ep_name)
+            if slug.lower() in seen_slugs:
+                # Prefer the built-in/canonical provider row when the config.yaml
+                # `providers:` section redefines a provider we already expose via
+                # auth/overlays/canonical catalogs (e.g. google-gemini-cli,
+                # kimi-coding). Showing both creates duplicate Telegram picker
+                # entries with the same provider slug.
+                continue
+
             display_name = ep_cfg.get("name", "") or ep_name
             api_url = ep_cfg.get("api", "") or ep_cfg.get("url", "") or ""
             default_model = ep_cfg.get("default_model", "")
@@ -1057,15 +1105,16 @@ def list_authenticated_providers(
             # Try to probe /v1/models if URL is set (but don't block on it)
             # For now just show what we know from config
             results.append({
-                "slug": ep_name,
+                "slug": slug,
                 "name": display_name,
-                "is_current": ep_name == current_provider,
+                "is_current": slug == current_provider or ep_name == current_provider,
                 "is_user_defined": True,
                 "models": models_list,
                 "total_models": len(models_list) if models_list else 0,
                 "source": "user-config",
                 "api_url": api_url,
             })
+            _mark_seen(slug)
 
     # --- 4. Saved custom providers from config ---
     # Each ``custom_providers`` entry represents one model under a named
@@ -1117,7 +1166,7 @@ def list_authenticated_providers(
                 "source": "user-config",
                 "api_url": grp["api_url"],
             })
-            seen_slugs.add(slug.lower())
+            _mark_seen(slug)
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))

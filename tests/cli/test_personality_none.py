@@ -69,6 +69,30 @@ class TestCLIPersonalityNone:
         output = " ".join(str(c) for c in mock_print.call_args_list)
         assert "none" in output.lower()
 
+    def test_alias_personality_resolves_to_renamed_research_persona(self):
+        cli = self._make_cli({
+            "main_assistant": "You are the Hermes Main Assistant — a versatile, professional AI.",
+            "lead_research_scientist": "You are a senior medical research expert specializing in OSAHS and the NLRP3 inflammasome.",
+            "ops_director": "You are a systems architect and SRE lead for VPS and gateway operations.",
+        })
+        with patch("cli.save_config_value", return_value=True):
+            cli._handle_personality_command("/personality research")
+        assert "OSAHS" in cli.system_prompt
+
+    def test_natural_switch_rewrite_uses_renamed_personality_keys(self):
+        import cli as cli_module
+
+        with patch.object(cli_module, "CLI_CONFIG", {
+            "agent": {
+                "personalities": {
+                    "main_assistant": "You are the Hermes Main Assistant — a versatile, professional AI.",
+                    "lead_research_scientist": "You are a senior medical research expert specializing in OSAHS and the NLRP3 inflammasome.",
+                    "ops_director": "You are a systems architect and SRE lead for VPS and gateway operations.",
+                }
+            }
+        }):
+            assert cli_module._rewrite_natural_personality_switch("切科研") == "/personality lead_research_scientist"
+
 
 # ── Gateway tests ──────────────────────────────────────────────────────────
 
@@ -78,6 +102,7 @@ class TestGatewayPersonalityNone:
         event = MagicMock()
         event.get_command.return_value = "personality"
         event.get_command_args.return_value = args
+        event.source = None
         return event
 
     def _make_runner(self, personalities=None):
@@ -155,6 +180,40 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         assert result == "No personalities configured in `~/.hermes/profiles/coder/config.yaml`"
+
+    @pytest.mark.asyncio
+    async def test_alias_personality_resolves_to_renamed_research_persona(self, tmp_path):
+        runner = self._make_runner()
+        config_data = {
+            "agent": {
+                "personalities": {
+                    "main_assistant": "You are the Hermes Main Assistant — a versatile, professional AI.",
+                    "lead_research_scientist": "You are a senior medical research expert specializing in OSAHS and the NLRP3 inflammasome.",
+                    "ops_director": "You are a systems architect and SRE lead for VPS and gateway operations.",
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config_data))
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            event = self._make_event("research")
+            result = await runner._handle_personality_command(event)
+
+        assert "lead_research_scientist" in result
+
+    def test_gateway_natural_switch_rewrite_uses_renamed_personality_keys(self):
+        import gateway.run as gateway_run
+
+        with patch.object(gateway_run, "_load_gateway_config", return_value={
+            "agent": {
+                "personalities": {
+                    "main_assistant": "You are the Hermes Main Assistant — a versatile, professional AI.",
+                    "lead_research_scientist": "You are a senior medical research expert specializing in OSAHS and the NLRP3 inflammasome.",
+                    "ops_director": "You are a systems architect and SRE lead for VPS and gateway operations.",
+                }
+            }
+        }):
+            assert gateway_run._rewrite_natural_personality_switch("切科研") == "/personality lead_research_scientist"
 
 
 class TestPersonalityDictFormat:

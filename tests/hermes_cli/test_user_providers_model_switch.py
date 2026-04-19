@@ -116,6 +116,105 @@ def test_list_authenticated_providers_fallback_to_default_only(monkeypatch):
     assert user_prov["models"] == ["single-model"]
 
 
+def test_list_authenticated_providers_skips_user_provider_duplicates_of_builtins(monkeypatch):
+    """Config `providers:` entries should not create duplicate rows for built-in providers."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    class _Pool:
+        def __init__(self, has_credentials: bool):
+            self._has_credentials = has_credentials
+
+        def has_credentials(self):
+            return self._has_credentials
+
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        lambda slug: _Pool(slug in {"google-gemini-cli", "kimi-coding"}),
+    )
+
+    class _Prov:
+        def __init__(self, slug, label):
+            self.slug = slug
+            self.label = label
+
+    monkeypatch.setattr(
+        "hermes_cli.models.CANONICAL_PROVIDERS",
+        [
+            _Prov("google-gemini-cli", "Google Gemini CLI"),
+            _Prov("kimi-coding", "Kimi / Kimi Coding Plan"),
+        ],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="google-gemini-cli",
+        user_providers={
+            "google-gemini-cli": {
+                "name": "google-gemini-cli",
+                "api": "acp://gemini-cli",
+                "models": ["gemini-3.1-pro-preview"],
+            },
+            "kimi-coding": {
+                "name": "kimi-coding",
+                "api": "https://api.moonshot.ai/v1",
+                "models": ["kimi-k2.5"],
+            },
+        },
+        custom_providers=[],
+        max_models=50,
+    )
+
+    assert [p["slug"] for p in providers].count("google-gemini-cli") == 1
+    assert [p["slug"] for p in providers].count("kimi-coding") == 1
+    assert not any(
+        p["slug"] == "google-gemini-cli" and p.get("is_user_defined")
+        for p in providers
+    )
+    assert not any(
+        p["slug"] == "kimi-coding" and p.get("is_user_defined")
+        for p in providers
+    )
+
+
+def test_list_authenticated_providers_skips_authenticated_zero_model_rows(monkeypatch):
+    """Authenticated providers with no curated models should not appear in /model pickers."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    class _Pool:
+        def __init__(self, has_credentials: bool):
+            self._has_credentials = has_credentials
+
+        def has_credentials(self):
+            return self._has_credentials
+
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        lambda slug: _Pool(slug == "openai"),
+    )
+
+    class _Prov:
+        def __init__(self, slug, label):
+            self.slug = slug
+            self.label = label
+
+    monkeypatch.setattr(
+        "hermes_cli.models.CANONICAL_PROVIDERS",
+        [_Prov("openai", "OpenAI")],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openai-codex",
+        user_providers={},
+        custom_providers=[],
+        max_models=50,
+    )
+
+    assert not any(p["slug"] == "openai" for p in providers)
+
+
 # =============================================================================
 # Tests for _get_named_custom_provider with providers: dict
 # =============================================================================

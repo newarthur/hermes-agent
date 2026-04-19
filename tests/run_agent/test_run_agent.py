@@ -938,6 +938,24 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 4096
 
+    def test_kimi_k2_6_preview_forces_temperature_0_6(self, agent):
+        agent.provider = "kimi-coding"
+        agent.base_url = "https://api.kimi.com/coding/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "kimi-k2.6-code-preview"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["temperature"] == 0.6
+
+    def test_kimi_k2_6_preview_overrides_invalid_temperature_override(self, agent):
+        agent.provider = "kimi-coding"
+        agent.base_url = "https://api.kimi.com/coding/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "kimi-k2.6-code-preview"
+        agent.request_overrides = {"temperature": 0.1}
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["temperature"] == 0.6
 
     def test_qwen_portal_formats_messages_and_metadata(self, agent):
         agent.base_url = "https://portal.qwen.ai/v1"

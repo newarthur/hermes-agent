@@ -13,6 +13,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from hermes_cli.env_loader import read_hermes_env_value
 from hermes_constants import OPENROUTER_BASE_URL
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
@@ -33,6 +34,8 @@ from hermes_cli.auth import (
     read_credential_pool,
     write_credential_pool,
 )
+from hermes_cli.env_loader import read_hermes_env_value
+from hermes_cli.env_loader import read_hermes_env_value
 
 logger = logging.getLogger(__name__)
 
@@ -1265,6 +1268,36 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 },
             )
 
+    elif provider == "google-gemini-cli":
+        # Gemini OAuth tokens live in ~/.hermes/auth/google_oauth.json, written by
+        # the Gemini OAuth flow. They aren't in the Hermes auth store or env vars,
+        # so resolve them here so that load_pool() and list_authenticated_providers()
+        # detect them.
+        try:
+            from agent import google_oauth
+            creds = google_oauth.load_credentials()
+            if creds and creds.get("access_token"):
+                source_name = "gemini_oauth"
+                active_sources.add(source_name)
+                changed |= _upsert_entry(
+                    entries,
+                    provider,
+                    source_name,
+                    {
+                        "source": source_name,
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": creds.get("access_token", ""),
+                        "refresh_token": creds.get("refresh_token"),
+                        "expires_at": creds.get("expires_at"),
+                        "token_type": creds.get("token_type"),
+                        "scope": creds.get("scope"),
+                        "client_id": creds.get("client_id"),
+                        "label": creds.get("email") or source_name,
+                    },
+                )
+        except Exception as exc:
+            logger.debug("Gemini OAuth token seed failed: %s", exc)
+
     return changed, active_sources
 
 
@@ -1296,7 +1329,10 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
+        if provider in ("kimi-coding", "kimi-coding-cn"):
+            env_url = read_hermes_env_value(pconfig.base_url_env_var).rstrip("/")
+        else:
+            env_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -1307,10 +1343,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         ]
 
     for env_var in env_vars:
-        token = os.getenv(env_var, "").strip()
+        if provider in ("kimi-coding", "kimi-coding-cn"):
+            token = read_hermes_env_value(env_var)
+            source = f"hermes_env:{env_var}"
+        else:
+            token = os.getenv(env_var, "").strip()
+            source = f"env:{env_var}"
         if not token:
             continue
-        source = f"env:{env_var}"
         active_sources.add(source)
         auth_type = AUTH_TYPE_OAUTH if provider == "anthropic" and not token.startswith("sk-ant-api") else AUTH_TYPE_API_KEY
         base_url = env_url or pconfig.inference_base_url
@@ -1341,7 +1381,8 @@ def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources:
         or entry.source in active_sources
         or not (
             entry.source.startswith("env:")
-            or entry.source in {"claude_code", "hermes_pkce"}
+            or entry.source.startswith("hermes_env:")
+            or entry.source in {"claude_code", "hermes_pkce", "gemini_oauth"}
         )
     ]
     if len(retained) == len(entries):

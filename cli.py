@@ -1521,6 +1521,114 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+def _compact_personality_token(value: str) -> str:
+    return str(value or "").strip().lower().replace("：", "").replace(":", "").replace(" ", "").replace("-", "").replace("_", "")
+
+
+def _personality_search_blob(name: str, value) -> str:
+    parts = [str(name or "")]
+    if isinstance(value, dict):
+        parts.extend(
+            str(value.get(key) or "")
+            for key in ("description", "system_prompt", "tone", "style")
+        )
+    else:
+        parts.append(str(value or ""))
+    return " ".join(parts).lower()
+
+
+def _pick_personality_by_role(personalities: dict, keywords: tuple[str, ...]) -> str | None:
+    for name, value in personalities.items():
+        blob = _personality_search_blob(name, value)
+        if any(keyword in blob for keyword in keywords):
+            return str(name or "").strip().lower()
+    return None
+
+
+def _build_personality_alias_map(personalities: dict) -> dict[str, str]:
+    if not isinstance(personalities, dict):
+        return {}
+
+    alias_map: dict[str, str] = {}
+    for name in personalities:
+        canonical = str(name or "").strip().lower()
+        if canonical:
+            alias_map[_compact_personality_token(canonical)] = canonical
+
+    role_targets = {
+        "main": _pick_personality_by_role(personalities, (
+            "hermes main",
+            "main assistant",
+            "daily assistant",
+            "general-purpose",
+            "science-popularization",
+            "ai-app-engineer",
+            "主助理",
+            "通用",
+        )),
+        "research": _pick_personality_by_role(personalities, (
+            "osahs",
+            "nlrp3",
+            "medical research",
+            "research scientist",
+            "lead research",
+            "科研",
+            "学术",
+            "审稿",
+            "课题",
+            "inflammasome",
+        )),
+        "ops": _pick_personality_by_role(personalities, (
+            "hermes ops",
+            "systems architect",
+            "sre",
+            "gateway",
+            "docker",
+            "vps",
+            "运维",
+            "系统",
+            "架构",
+        )),
+    }
+
+    for alias in ("切助理", "切主助理", "切到助理", "切到主助理", "切通用", "切到通用", "主助理", "助理模式", "通用模式", "assistant", "main", "general"):
+        if role_targets["main"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["main"]
+    for alias in ("切科研", "切到科研", "科研模式", "学术模式", "科研", "学术", "research", "science"):
+        if role_targets["research"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["research"]
+    for alias in ("切运维", "切到运维", "运维模式", "系统模式", "运维", "系统", "ops", "sre"):
+        if role_targets["ops"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["ops"]
+
+    legacy_aliases = {
+        "hermesmain": role_targets["main"],
+        "hermesosahs": role_targets["research"],
+        "hermesops": role_targets["ops"],
+        "osahsresearch": role_targets["research"],
+        "openclawops": role_targets["ops"],
+    }
+    for alias, canonical in legacy_aliases.items():
+        if canonical:
+            alias_map[alias] = canonical
+    return alias_map
+
+
+def _resolve_personality_name(raw: str, personalities: dict) -> str:
+    normalized = _compact_personality_token(raw)
+    if not normalized or not isinstance(personalities, dict):
+        return ""
+    return _build_personality_alias_map(personalities).get(normalized, "")
+
+
+def _rewrite_natural_personality_switch(text: str) -> str:
+    """Map common natural-language Chinese persona switches to /personality."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    personalities = ((CLI_CONFIG.get("agent", {}) or {}).get("personalities", {}) or {}) if isinstance(CLI_CONFIG, dict) else {}
+    personality = _resolve_personality_name(raw, personalities)
+    return f"/personality {personality}" if personality else raw
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -5123,7 +5231,8 @@ class HermesCLI:
         
         if len(parts) > 1:
             # Set personality
-            personality_name = parts[1].strip().lower()
+            requested_name = parts[1].strip().lower()
+            personality_name = _resolve_personality_name(requested_name, self.personalities) or requested_name
             
             if personality_name in ("none", "default", "neutral"):
                 self.system_prompt = ""
@@ -5142,7 +5251,7 @@ class HermesCLI:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
-                print(f"(._.) Unknown personality: {personality_name}")
+                print(f"(._.) Unknown personality: {requested_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")
         else:
             # Show available personalities

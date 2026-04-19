@@ -38,6 +38,7 @@ import httpx
 import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
+from hermes_cli.env_loader import read_hermes_env_value
 from hermes_constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -404,9 +405,15 @@ def _resolve_api_key_provider_secret(
         return "", ""
 
     for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
+        if provider_id in ("kimi-coding", "kimi-coding-cn"):
+            hermes_val = read_hermes_env_value(env_var)
+            val = hermes_val or os.getenv(env_var, "").strip()
+            source = f"hermes_env:{env_var}" if hermes_val else env_var
+        else:
+            val = os.getenv(env_var, "").strip()
+            source = env_var
         if has_usable_secret(val):
-            return val, env_var
+            return val, source
 
     return "", ""
 
@@ -1705,6 +1712,108 @@ def resolve_codex_runtime_credentials(
     }
 
 
+def _resolve_legacy_gemini_auth() -> Optional[Dict[str, Any]]:
+    """Fallback: read legacy Google Gemini tokens from auth.json providers state."""
+    auth_store = _load_auth_store()
+    state = _load_provider_state(auth_store, "google-gemini-cli")
+    if not isinstance(state, dict):
+        return None
+    tokens = state.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    access_token = tokens.get("access_token", "").strip()
+    if not access_token:
+        return None
+    pconfig = PROVIDER_REGISTRY.get("google-gemini-cli")
+    base_url = (
+        pconfig.inference_base_url
+        if pconfig
+        else "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+    return {
+        "provider": "google-gemini-cli",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "legacy-auth-json",
+    }
+
+
+def resolve_gemini_runtime_credentials(
+    *,
+    refresh_if_expiring: bool = True,
+) -> Dict[str, Any]:
+    """Resolve runtime credentials from Hermes's Gemini OAuth store."""
+    from agent import google_oauth
+
+    try:
+        access_token = google_oauth.get_valid_access_token(
+            refresh_if_expiring=refresh_if_expiring,
+            skew_seconds=google_oauth.REFRESH_SKEW_SECONDS,
+        )
+    except RuntimeError:
+        access_token = ""
+
+    if access_token:
+        pconfig = PROVIDER_REGISTRY.get("google-gemini-cli")
+        base_url = (
+            pconfig.inference_base_url
+            if pconfig
+            else "https://generativelanguage.googleapis.com/v1beta/openai"
+        )
+        return {
+            "provider": "google-gemini-cli",
+            "base_url": base_url,
+            "api_key": access_token,
+            "source": "google-oauth-pkce",
+            "auth_file": str(google_oauth.GEMINI_OAUTH_FILE),
+        }
+
+    # Fallback to legacy auth.json provider state
+    legacy = _resolve_legacy_gemini_auth()
+    if legacy:
+        legacy["auth_file"] = str(_auth_file_path())
+        return legacy
+
+    raise AuthError(
+        "No Gemini OAuth credentials found. Run `hermes auth add google-gemini-cli` to authenticate, "
+        "or set GEMINI_API_KEY / GOOGLE_API_KEY.",
+        provider="google-gemini-cli",
+        code="gemini_oauth_missing",
+        relogin_required=True,
+    )
+
+
+def get_gemini_auth_status() -> Dict[str, Any]:
+    """Status snapshot for Gemini OAuth."""
+    from agent import google_oauth
+
+    auth_path = google_oauth.GEMINI_OAUTH_FILE
+    try:
+        creds = resolve_gemini_runtime_credentials(refresh_if_expiring=False)
+        return {
+            "logged_in": True,
+            "auth_file": creds.get("auth_file", str(auth_path)),
+            "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
+        }
+    except AuthError:
+        pass
+
+    # Fallback to legacy auth.json provider state
+    legacy = _resolve_legacy_gemini_auth()
+    if legacy:
+        return {
+            "logged_in": True,
+            "auth_file": str(_auth_file_path()),
+            "source": legacy.get("source"),
+            "api_key": legacy.get("api_key"),
+        }
+
+    return {
+        "logged_in": False,
+        "auth_file": str(auth_path),
+        "error": "No Gemini OAuth credentials found.",
+    }
 # =============================================================================
 # TLS verification helper
 # =============================================================================
@@ -2584,7 +2693,10 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        if provider_id in ("kimi-coding", "kimi-coding-cn"):
+            env_url = read_hermes_env_value(pconfig.base_url_env_var) or os.getenv(pconfig.base_url_env_var, "").strip()
+        else:
+            env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
     if provider_id in ("kimi-coding", "kimi-coding-cn"):
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -2679,7 +2791,10 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        if provider_id in ("kimi-coding", "kimi-coding-cn"):
+            env_url = read_hermes_env_value(pconfig.base_url_env_var) or os.getenv(pconfig.base_url_env_var, "").strip()
+        else:
+            env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
     if provider_id in ("kimi-coding", "kimi-coding-cn"):
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)

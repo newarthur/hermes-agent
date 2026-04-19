@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
+from hermes_cli.env_loader import read_hermes_env_value
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -1528,8 +1529,19 @@ def resolve_provider_client(
     if provider == "custom":
         if explicit_base_url:
             custom_base = explicit_base_url.strip()
+            custom_base_lower = custom_base.lower()
+            custom_key = (explicit_api_key or "").strip()
+            if not custom_key and "api.kimi.com" in custom_base_lower:
+                custom_key = read_hermes_env_value("KIMI_API_KEY") or os.getenv("KIMI_API_KEY", "").strip()
+            if not custom_key and "api.moonshot" in custom_base_lower:
+                custom_key = (
+                    read_hermes_env_value("KIMI_API_KEY")
+                    or os.getenv("KIMI_API_KEY", "").strip()
+                    or read_hermes_env_value("KIMI_CN_API_KEY")
+                    or os.getenv("KIMI_CN_API_KEY", "").strip()
+                )
             custom_key = (
-                (explicit_api_key or "").strip()
+                custom_key
                 or os.getenv("OPENAI_API_KEY", "").strip()
                 or "no-key-required"  # local servers don't need auth
             )
@@ -1544,9 +1556,9 @@ def resolve_provider_client(
                 provider,
             )
             extra = {}
-            if "api.kimi.com" in custom_base.lower():
+            if "api.kimi.com" in custom_base_lower:
                 extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
-            elif "api.githubcopilot.com" in custom_base.lower():
+            elif "api.githubcopilot.com" in custom_base_lower:
                 from hermes_cli.models import copilot_default_headers
                 extra["default_headers"] = copilot_default_headers()
             client = OpenAI(api_key=custom_key, base_url=custom_base, **extra)
@@ -2357,7 +2369,21 @@ def _build_call_kwargs(
         if _forbids_sampling_params(model):
             temperature = None
 
-    if temperature is not None:
+    provider_lower = (provider or "").strip().lower()
+    model_lower = (model or "").strip().lower()
+    base_url_lower = (base_url or "").strip().lower()
+
+    # Kimi Coding preview currently requires temperature=0.6 exactly.
+    # Apply it centrally for both omitted and explicitly overridden values.
+    if (
+        model_lower == "kimi-k2.6-code-preview"
+        and (
+            provider_lower == "kimi-coding"
+            or "api.kimi.com/coding/v1" in base_url_lower
+        )
+    ):
+        kwargs["temperature"] = 0.6
+    elif temperature is not None:
         kwargs["temperature"] = temperature
 
     if max_tokens is not None:

@@ -241,7 +241,15 @@ def _has_any_provider_configured() -> bool:
     for pconfig in PROVIDER_REGISTRY.values():
         if pconfig.auth_type == "api_key":
             provider_env_vars.update(pconfig.api_key_env_vars)
-    if any(os.getenv(v) for v in provider_env_vars):
+    try:
+        from hermes_cli.env_loader import read_hermes_env_value
+    except Exception:
+        read_hermes_env_value = None
+    def _env_present(var: str) -> bool:
+        if var in {"KIMI_API_KEY", "KIMI_CN_API_KEY", "KIMI_BASE_URL"} and read_hermes_env_value:
+            return bool(read_hermes_env_value(var))
+        return bool(os.getenv(var))
+    if any(_env_present(v) for v in provider_env_vars):
         return True
 
     # Check .env file for keys

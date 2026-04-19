@@ -167,6 +167,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-oss-120b",
     ],
     "kimi-coding": [
+        "kimi-k2.6-code-preview",
         "kimi-k2.5",
         "kimi-for-coding",
         "kimi-k2-thinking",
@@ -1094,11 +1095,16 @@ def detect_provider_for_model(
         has_creds = False
         try:
             from hermes_cli.auth import PROVIDER_REGISTRY
+            from hermes_cli.env_loader import read_hermes_env_value
             pconfig = PROVIDER_REGISTRY.get(direct_match)
             if pconfig:
                 import os
                 for env_var in pconfig.api_key_env_vars:
-                    if os.getenv(env_var, "").strip():
+                    if direct_match in ("kimi-coding", "kimi-coding-cn"):
+                        if read_hermes_env_value(env_var):
+                            has_creds = True
+                            break
+                    elif os.getenv(env_var, "").strip():
                         has_creds = True
                         break
         except Exception:

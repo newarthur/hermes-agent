@@ -5847,15 +5847,19 @@ class AIAgent:
                             entry["id"] = tc_delta.id
                         if tc_delta.function:
                             if tc_delta.function.name:
-                                # Use assignment, not +=.  Function names are
-                                # atomic identifiers delivered complete in the
-                                # first chunk (OpenAI spec).  Some providers
-                                # (MiniMax M2.7 via NVIDIA NIM) resend the full
-                                # name in every chunk; concatenation would
-                                # produce "read_fileread_file".  Assignment
-                                # (matching the OpenAI Node SDK / LiteLLM /
-                                # Vercel AI patterns) is immune to this.
-                                entry["function"]["name"] = tc_delta.function.name
+                                # Handle both provider behaviors seen in the wild:
+                                # - full-name resend in later chunks (avoid duplicates)
+                                # - partial-name streaming across chunks (web_ + search)
+                                incoming_name = tc_delta.function.name
+                                current_name = entry["function"]["name"]
+                                if not current_name:
+                                    entry["function"]["name"] = incoming_name
+                                elif incoming_name == current_name or current_name.endswith(incoming_name):
+                                    pass
+                                elif incoming_name.startswith(current_name):
+                                    entry["function"]["name"] = incoming_name
+                                else:
+                                    entry["function"]["name"] = current_name + incoming_name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
                         extra = getattr(tc_delta, "extra_content", None)
@@ -7149,6 +7153,20 @@ class AIAgent:
         # Applied last so overrides win over any defaults set above.
         if self.request_overrides:
             api_kwargs.update(self.request_overrides)
+
+        # Kimi Coding preview currently rejects any temperature other than 0.6.
+        # When temperature is omitted, the upstream route returns HTTP 400.
+        # Force the required value so chats and cron jobs both succeed.
+        _model_lower = (self.model or "").strip().lower()
+        _provider_lower = (self.provider or "").strip().lower()
+        if (
+            _model_lower == "kimi-k2.6-code-preview"
+            and (
+                _provider_lower == "kimi-coding"
+                or "api.kimi.com/coding/v1" in self._base_url_lower
+            )
+        ):
+            api_kwargs["temperature"] = 0.6
 
         return api_kwargs
 

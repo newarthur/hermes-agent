@@ -480,6 +480,259 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _normalize_persona_fallback(route: dict | None) -> list | dict | None:
+    """Normalize fallback config embedded in a persona route."""
+    if not isinstance(route, dict):
+        return None
+    fb_chain = route.get("fallback_providers")
+    if isinstance(fb_chain, list) and fb_chain:
+        return fb_chain
+    fb_single = route.get("fallback_model")
+    if isinstance(fb_single, dict) and fb_single:
+        return fb_single
+    return None
+
+
+
+def _load_active_personality(config: dict | None = None) -> str:
+    """Read the currently selected personality name from config.yaml."""
+    cfg = config if config is not None else _load_gateway_config()
+    display_cfg = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+    if isinstance(display_cfg, dict):
+        active = str(display_cfg.get("personality", "") or "").strip().lower()
+        if active and active not in {"none", "default", "neutral"}:
+            return active
+    return ""
+
+
+
+def _load_persona_model_routes(config: dict | None = None) -> dict:
+    """Load optional per-personality model routing config."""
+    cfg = config if config is not None else _load_gateway_config()
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    routes = agent_cfg.get("persona_model_routes", {}) if isinstance(agent_cfg, dict) else {}
+    return routes if isinstance(routes, dict) else {}
+
+
+
+def _format_persona_route_summary(personality: str, config: dict | None = None) -> list[str]:
+    """Return human-readable primary/fallback lines for a personality route."""
+    route = _load_persona_model_routes(config).get((personality or "").strip().lower())
+    if not isinstance(route, dict):
+        return []
+
+    primary_provider = str(route.get("provider") or "").strip()
+    primary_model = str(route.get("model") or route.get("default") or "").strip()
+    if not primary_model:
+        return []
+
+    lines = [f"Primary: {primary_provider or 'default'} / {primary_model}"]
+    fallback = _normalize_persona_fallback(route)
+    if isinstance(fallback, dict) and fallback:
+        fb_provider = str(fallback.get("provider") or "").strip()
+        fb_model = str(fallback.get("model") or "").strip()
+        if fb_model:
+            lines.append(f"Fallback: {fb_provider or 'default'} / {fb_model}")
+    elif isinstance(fallback, list) and fallback:
+        for idx, item in enumerate(fallback, start=1):
+            if not isinstance(item, dict):
+                continue
+            fb_provider = str(item.get("provider") or "").strip()
+            fb_model = str(item.get("model") or "").strip()
+            if fb_model:
+                lines.append(f"Fallback {idx}: {fb_provider or 'default'} / {fb_model}")
+    return lines
+
+
+
+def _compact_personality_token(value: str) -> str:
+    return str(value or "").strip().lower().replace("：", "").replace(":", "").replace(" ", "").replace("-", "").replace("_", "")
+
+
+def _personality_search_blob(name: str, value) -> str:
+    parts = [str(name or "")]
+    if isinstance(value, dict):
+        parts.extend(
+            str(value.get(key) or "")
+            for key in ("description", "system_prompt", "tone", "style")
+        )
+    else:
+        parts.append(str(value or ""))
+    return " ".join(parts).lower()
+
+
+def _pick_personality_by_role(personalities: dict, keywords: tuple[str, ...]) -> str | None:
+    for name, value in personalities.items():
+        blob = _personality_search_blob(name, value)
+        if any(keyword in blob for keyword in keywords):
+            return str(name or "").strip().lower()
+    return None
+
+
+def _build_personality_alias_map(personalities: dict) -> dict[str, str]:
+    if not isinstance(personalities, dict):
+        return {}
+
+    alias_map: dict[str, str] = {}
+    for name in personalities:
+        canonical = str(name or "").strip().lower()
+        if canonical:
+            alias_map[_compact_personality_token(canonical)] = canonical
+
+    role_targets = {
+        "main": _pick_personality_by_role(personalities, (
+            "hermes main",
+            "main assistant",
+            "daily assistant",
+            "general-purpose",
+            "science-popularization",
+            "ai-app-engineer",
+            "主助理",
+            "通用",
+        )),
+        "research": _pick_personality_by_role(personalities, (
+            "osahs",
+            "nlrp3",
+            "medical research",
+            "research scientist",
+            "lead research",
+            "科研",
+            "学术",
+            "审稿",
+            "课题",
+            "inflammasome",
+        )),
+        "ops": _pick_personality_by_role(personalities, (
+            "hermes ops",
+            "systems architect",
+            "sre",
+            "gateway",
+            "docker",
+            "vps",
+            "运维",
+            "系统",
+            "架构",
+        )),
+    }
+
+    for alias in ("切助理", "切主助理", "切到助理", "切到主助理", "切通用", "切到通用", "主助理", "助理模式", "通用模式", "assistant", "main", "general"):
+        if role_targets["main"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["main"]
+    for alias in ("切科研", "切到科研", "科研模式", "学术模式", "科研", "学术", "research", "science"):
+        if role_targets["research"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["research"]
+    for alias in ("切运维", "切到运维", "运维模式", "系统模式", "运维", "系统", "ops", "sre"):
+        if role_targets["ops"]:
+            alias_map[_compact_personality_token(alias)] = role_targets["ops"]
+
+    legacy_aliases = {
+        "hermesmain": role_targets["main"],
+        "hermesosahs": role_targets["research"],
+        "hermesops": role_targets["ops"],
+        "osahsresearch": role_targets["research"],
+        "openclawops": role_targets["ops"],
+    }
+    for alias, canonical in legacy_aliases.items():
+        if canonical:
+            alias_map[alias] = canonical
+    return alias_map
+
+
+def _resolve_personality_name(raw: str, personalities: dict) -> str:
+    normalized = _compact_personality_token(raw)
+    if not normalized or not isinstance(personalities, dict):
+        return ""
+    return _build_personality_alias_map(personalities).get(normalized, "")
+
+
+def _rewrite_natural_personality_switch(text: str) -> str:
+    """Map common natural-language Chinese persona switches to /personality."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    config = _load_gateway_config()
+    personalities = config.get("agent", {}).get("personalities", {}) if isinstance(config, dict) else {}
+    personality = _resolve_personality_name(raw, personalities)
+    return f"/personality {personality}" if personality else raw
+
+
+
+def _match_natural_status_query(text: str) -> bool:
+    """Return True when the message asks for current persona/model state."""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    normalized = raw.replace("：", "").replace(":", "").replace(" ", "")
+    return normalized in {
+        "你现在是什么人格",
+        "你现在是哪个人格",
+        "当前人格",
+        "当前模型",
+        "当前状态",
+        "当前助理",
+    }
+
+
+
+def _build_natural_status_response(config: dict | None = None) -> str:
+    """Build a compact status summary for natural-language status queries."""
+    cfg = config if config is not None else _load_gateway_config()
+    personality = _load_active_personality(cfg) or "none"
+    lines = [f"当前人格：{personality}"]
+
+    route = _load_persona_model_routes(cfg).get(personality, {}) if personality != "none" else {}
+    if isinstance(route, dict) and route:
+        provider = str(route.get("provider") or "default").strip()
+        model = str(route.get("model") or route.get("default") or "").strip()
+        if model:
+            lines.append(f"主模型：{provider} / {model}")
+        fallback = _normalize_persona_fallback(route)
+        if isinstance(fallback, dict) and fallback:
+            fb_provider = str(fallback.get("provider") or "default").strip()
+            fb_model = str(fallback.get("model") or "").strip()
+            if fb_model:
+                lines.append(f"Fallback：{fb_provider} / {fb_model}")
+        elif isinstance(fallback, list) and fallback:
+            for idx, item in enumerate(fallback, start=1):
+                if not isinstance(item, dict):
+                    continue
+                fb_provider = str(item.get("provider") or "default").strip()
+                fb_model = str(item.get("model") or "").strip()
+                if fb_model:
+                    lines.append(f"Fallback {idx}：{fb_provider} / {fb_model}")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        providers_to_check = []
+        if route.get("provider"):
+            providers_to_check.append(str(route.get("provider")))
+        fallback = _normalize_persona_fallback(route)
+        if isinstance(fallback, dict) and fallback.get("provider"):
+            providers_to_check.append(str(fallback.get("provider")))
+        elif isinstance(fallback, list):
+            for item in fallback:
+                if isinstance(item, dict) and item.get("provider"):
+                    providers_to_check.append(str(item.get("provider")))
+
+        seen = set()
+        status_lines = []
+        for provider_id in providers_to_check:
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            try:
+                runtime = resolve_runtime_provider(requested=provider_id)
+                ready = bool(runtime.get("api_key") or runtime.get("command") or runtime.get("credential_pool"))
+                status_lines.append(f"{provider_id}: {'可用' if ready else '未就绪'}")
+            except Exception as exc:
+                status_lines.append(f"{provider_id}: 异常 ({str(exc)[:80]})")
+        if status_lines:
+            lines.append("Provider状态：")
+            lines.extend(f"- {line}" for line in status_lines)
+    else:
+        lines.append("当前未配置对应的人格路由")
+
+    return "\n".join(lines)
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -5440,7 +5693,7 @@ class GatewayRunner:
         import yaml
         from hermes_constants import display_hermes_home
 
-        args = event.get_command_args().strip().lower()
+        raw_args = event.get_command_args().strip().lower()
         config_path = _hermes_home / 'config.yaml'
 
         try:
@@ -5458,7 +5711,7 @@ class GatewayRunner:
         if not personalities:
             return f"No personalities configured in `{display_hermes_home()}/config.yaml`"
 
-        if not args:
+        if not raw_args:
             lines = ["🎭 **Available Personalities**\n"]
             lines.append("• `none` — (no personality overlay)")
             for name, prompt in personalities.items():
@@ -5480,6 +5733,19 @@ class GatewayRunner:
                 return "\n".join(p for p in parts if p)
             return str(value)
 
+        def _clear_session_model_override() -> bool:
+            """Drop any session /model override so personality routing can apply."""
+            if not session_key:
+                return False
+            cleared = False
+            if hasattr(self, "_session_model_overrides") and session_key in self._session_model_overrides:
+                self._session_model_overrides.pop(session_key, None)
+                cleared = True
+            if hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes.pop(session_key, None)
+            return cleared
+
+        args = _resolve_personality_name(raw_args, personalities) or raw_args
         if args in ("none", "default", "neutral"):
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
@@ -5508,7 +5774,7 @@ class GatewayRunner:
             return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
-        return f"Unknown personality: `{args}`\n\nAvailable: {available}"
+        return f"Unknown personality: `{raw_args}`\n\nAvailable: {available}"
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""

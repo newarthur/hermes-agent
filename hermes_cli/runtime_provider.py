@@ -616,7 +616,11 @@ def _resolve_explicit_runtime(
     if pconfig and pconfig.auth_type == "api_key":
         env_url = ""
         if pconfig.base_url_env_var:
-            env_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
+            if provider in ("kimi-coding", "kimi-coding-cn"):
+                from hermes_cli.env_loader import read_hermes_env_value
+                env_url = read_hermes_env_value(pconfig.base_url_env_var).rstrip("/")
+            else:
+                env_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
 
         base_url = explicit_base_url
         if not base_url:

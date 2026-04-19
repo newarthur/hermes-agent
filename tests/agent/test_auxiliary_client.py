@@ -16,6 +16,7 @@ from agent.auxiliary_client import (
     auxiliary_max_tokens_param,
     call_llm,
     async_call_llm,
+    _build_call_kwargs,
     _read_codex_access_token,
     _get_provider_chain,
     _is_payment_error,
@@ -436,6 +437,35 @@ class TestExpiredCodexFallback:
 class TestExplicitProviderRouting:
     """Test explicit provider selection bypasses auto chain correctly."""
 
+    def test_custom_kimi_endpoint_uses_kimi_api_key_env(self, monkeypatch):
+        monkeypatch.setenv("KIMI_API_KEY", "kimi-secret-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client(
+                "custom",
+                model="kimi-k2.6-code-preview",
+                explicit_base_url="https://api.kimi.com/coding/v1",
+            )
+
+        assert client is not None
+        assert model == "kimi-k2.6-code-preview"
+        mock_openai.assert_called_once()
+        assert mock_openai.call_args.kwargs["api_key"] == "kimi-secret-key"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://api.kimi.com/coding/v1"
+        assert mock_openai.call_args.kwargs["default_headers"] == {"User-Agent": "KimiCLI/1.30.0"}
+
+    def test_explicit_anthropic_oauth(self, monkeypatch):
+        """provider='anthropic' + OAuth token should work with is_oauth=True."""
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-explicit-test")
+        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
+            mock_build.return_value = MagicMock()
+            client, model = resolve_provider_client("anthropic")
+            assert client is not None
+            # Verify OAuth flag propagated
+            adapter = client.chat.completions
+            assert adapter._is_oauth is True
     def test_explicit_anthropic_api_key(self, monkeypatch):
         """provider='anthropic' + regular API key should work with is_oauth=False."""
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-api-regular-key"), \
@@ -447,6 +477,88 @@ class TestExplicitProviderRouting:
             adapter = client.chat.completions
             assert adapter._is_oauth is False
 
+    def test_explicit_openrouter(self, monkeypatch):
+        """provider='openrouter' should use OPENROUTER_API_KEY."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-explicit")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("openrouter")
+            assert client is not None
+
+    def test_explicit_kimi(self, monkeypatch):
+        """provider='kimi-coding' should use KIMI_API_KEY."""
+        monkeypatch.setenv("KIMI_API_KEY", "kimi-test-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("kimi-coding")
+            assert client is not None
+
+    def test_explicit_minimax(self, monkeypatch):
+        """provider='minimax' should use MINIMAX_API_KEY."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "mm-test-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("minimax")
+            assert client is not None
+
+
+class TestBuildCallKwargs:
+    def test_kimi_k2_6_preview_forces_temperature_0_6(self):
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model="kimi-k2.6-code-preview",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.1,
+        )
+        assert kwargs["temperature"] == 0.6
+
+    def test_custom_kimi_coding_endpoint_forces_temperature_0_6(self):
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="kimi-k2.6-code-preview",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=None,
+            base_url="https://api.kimi.com/coding/v1",
+        )
+        assert kwargs["temperature"] == 0.6
+
+    def test_explicit_deepseek(self, monkeypatch):
+        """provider='deepseek' should use DEEPSEEK_API_KEY."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("deepseek")
+            assert client is not None
+
+    def test_explicit_zai(self, monkeypatch):
+        """provider='zai' should use GLM_API_KEY."""
+        monkeypatch.setenv("GLM_API_KEY", "zai-test-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("zai")
+            assert client is not None
+
+    def test_explicit_google_alias_uses_gemini_credentials(self):
+        """provider='google' should route through the gemini API-key provider."""
+        with (
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
+                "api_key": "gemini-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            }),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("google", model="gemini-3.1-pro-preview")
+
+        assert client is not None
+        assert model == "gemini-3.1-pro-preview"
+        assert mock_openai.call_args.kwargs["api_key"] == "gemini-key"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    def test_explicit_unknown_returns_none(self, monkeypatch):
+        """Unknown provider should return None."""
+        client, model = resolve_provider_client("nonexistent-provider")
+        assert client is None
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
 
