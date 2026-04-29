@@ -301,12 +301,22 @@ def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch)
 
 ## 上游 Sync 后恢复流程
 
+### 与 `hermes-safe-update-with-local-patches` Skill 的协作
+
+**Skill 负责**：安全地同步上游、创建备份、处理合并冲突  
+**本文档负责**：在 skill 完成后，指导如何重新应用本地 patch
+
+**执行顺序**：
+1. 先执行 `hermes-safe-update-with-local-patches` skill 完成上游同步
+2. 然后参考本文档的 "Patch 内容" 部分手动恢复各文件
+3. 最后修复测试并提交
+
 ### 自动恢复脚本
 
 ```bash
 #!/bin/bash
 # restore-local-patches.sh
-# 在上游 sync 后执行
+# 在上游 sync 后执行（skill 完成后）
 
 cd ~/.hermes/hermes-agent
 
@@ -351,17 +361,19 @@ git commit -m "restore: re-apply high-value local patches after upstream sync ($
 
 ### 手动恢复步骤
 
-1. **解决合并冲突**（如果 sync 时发生冲突）
-   - 对每个冲突文件，保留上游的兼容性修复
-   - 重新应用本地 patch 的逻辑（不要直接 cherry-pick 整个文件）
+1. **执行 skill 完成上游同步**
+   - 运行 `hermes-safe-update-with-local-patches` skill
+   - 解决合并冲突（保留上游的兼容性修复）
+   - 确认 `main` 已对齐 `upstream/main`
 
-2. **应用 patch**
-   - 参考本清单中的 "Patch 内容" 部分
+2. **应用 patch**（参考本文档 "Patch 内容" 部分）
    - 逐文件检查并应用修改
+   - 不要直接 cherry-pick 整个文件（可能覆盖上游修复）
+   - 优先使用 `git cherry-pick --no-commit <patch-commit>`
 
 3. **修复测试**
    - 运行 `pytest tests/hermes_cli/test_user_providers_model_switch.py`
-   - 根据失败信息更新测试期望
+   - 根据失败信息更新测试期望（参考 "测试适配" 部分）
 
 4. **验证**
    - `hermes model` 正确显示 provider 列表
