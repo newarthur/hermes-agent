@@ -255,13 +255,26 @@ def test_openai_native_curated_catalog_is_non_empty():
 
 
 def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch):
-    """Built-in openai row must not report total_models=0 when creds exist."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    """Built-in openai-codex row must not report total_models=0 when creds exist."""
+    # openai-codex uses OAuth (not API key), so we mock HERMES_OVERLAYS
+    # and the credential pool to simulate an authenticated state.
+    from hermes_cli.providers import HermesOverlay
     monkeypatch.setattr(
         "agent.models_dev.fetch_models_dev",
-        lambda: {"openai": {"env": ["OPENAI_API_KEY"]}},
+        lambda: {"openai": {"env": []}},
     )
-    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.providers.HERMES_OVERLAYS",
+        {"openai": HermesOverlay(
+            auth_type="oauth_external",
+            extra_env_vars=[],
+        )},
+    )
+    # Mock credential pool to report credentials exist
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        lambda provider: type("MockPool", (), {"has_credentials": lambda self: True})(),
+    )
 
     providers = list_authenticated_providers(
         current_provider="",
@@ -270,8 +283,8 @@ def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch)
         custom_providers=[],
         max_models=50,
     )
-    row = next((p for p in providers if p.get("slug") == "openai"), None)
-    assert row is not None
+    row = next((p for p in providers if p.get("slug") == "openai-codex"), None)
+    assert row is not None, f"openai-codex not found in providers: {[p.get('slug') for p in providers]}"
     assert row["total_models"] > 0
 
 
