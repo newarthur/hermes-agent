@@ -207,12 +207,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
     "kimi-coding": ProviderConfig(
         id="kimi-coding",
-        name="Kimi / Moonshot",
+        name="Kimi / Kimi Coding Plan",
         auth_type="api_key",
-        # Legacy platform.moonshot.ai keys use this endpoint (OpenAI-compat).
-        # sk-kimi- (Kimi Code) keys are auto-redirected to api.kimi.com/coding
-        # by _resolve_kimi_base_url() below.
-        inference_base_url="https://api.moonshot.ai/v1",
+        # In this Hermes setup, kimi-coding is the Kimi Coding Plan endpoint.
+        # It uses sk-kimi-* keys and Anthropic Messages-compatible requests at
+        # https://api.kimi.com/coding/v1/messages. Legacy Moonshot endpoints are
+        # intentionally kept separate to avoid silently routing Coding keys to
+        # api.moonshot.ai/v1 after upgrades.
+        inference_base_url="https://api.kimi.com/coding/v1",
         api_key_env_vars=("KIMI_API_KEY", "KIMI_CODING_API_KEY"),
         base_url_env_var="KIMI_BASE_URL",
     ),
@@ -424,17 +426,11 @@ def get_anthropic_key() -> str:
 # Kimi Code Endpoint Detection
 # =============================================================================
 
-# Kimi Code (kimi.com/code) issues keys prefixed "sk-kimi-" that only work
-# on api.kimi.com/coding.  Legacy keys from platform.moonshot.ai work on
-# api.moonshot.ai/v1 (the old default).  Auto-detect when user hasn't set
-# KIMI_BASE_URL explicitly.
-#
-# Note: the base URL intentionally has NO /v1 suffix.  The /coding endpoint
-# speaks the Anthropic Messages protocol, and the anthropic SDK appends
-# "/v1/messages" internally — so "/coding" + SDK suffix → "/coding/v1/messages"
-# (the correct target). Using "/coding/v1" here would produce
-# "/coding/v1/v1/messages" (a 404).
-KIMI_CODE_BASE_URL = "https://api.kimi.com/coding"
+# Kimi Code (kimi.com/code) issues keys prefixed "sk-kimi-" that work on
+# api.kimi.com/coding/v1. The endpoint accepts Anthropic Messages-compatible
+# requests at /messages (Kimi returns a 403 on the OpenAI chat/completions route
+# for non-coding-agent clients). Keep this separate from legacy Moonshot URLs.
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
 
 
 def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
@@ -498,10 +494,19 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
-    from hermes_cli.config import get_env_value
     for env_var in pconfig.api_key_env_vars:
-        # Check both os.environ and ~/.hermes/.env file
-        val = (get_env_value(env_var) or "").strip()
+        # Prefer the live environment, but also fall back to ~/.hermes/.env.
+        # Gateway processes launched by user systemd do not always inherit the
+        # same shell environment after upgrades/restarts; get_env_value keeps
+        # API-key providers stable without requiring every launcher to source
+        # ~/.hermes/.env itself.
+        val = os.getenv(env_var, "").strip()
+        if not val:
+            try:
+                from hermes_cli.config import get_env_value
+                val = (get_env_value(env_var) or "").strip()
+            except Exception:
+                val = ""
         if has_usable_secret(val):
             return val, env_var
 

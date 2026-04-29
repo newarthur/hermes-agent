@@ -30,6 +30,7 @@ from hermes_cli.providers import (
     determine_api_mode,
     get_label,
     is_aggregator,
+    normalize_provider,
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
@@ -936,7 +937,7 @@ def switch_model(
     # on opencode-zen) hit a double /v1 and returned OpenCode's website 404 page.
     if (
         api_mode == "anthropic_messages"
-        and target_provider in {"opencode-zen", "opencode-go"}
+        and target_provider in {"opencode-zen", "opencode-go", "kimi-coding"}
         and isinstance(base_url, str)
         and base_url
     ):
@@ -1330,9 +1331,10 @@ def list_authenticated_providers(
         for ep_name, ep_cfg in user_providers.items():
             if not isinstance(ep_cfg, dict):
                 continue
-            # Skip if this slug was already emitted (e.g. canonical provider
-            # with the same name) or will be picked up by section 4.
-            if ep_name.lower() in seen_slugs:
+            normalized_ep_name = normalize_provider(ep_name)
+            # Skip if this slug (or one of its aliases) was already emitted
+            # by sections 1-2, or will be picked up by section 4.
+            if ep_name.lower() in seen_slugs or normalized_ep_name in seen_mdev_ids:
                 continue
             display_name = ep_cfg.get("name", "") or ep_name
             # ``base_url`` is Hermes's canonical write key (matches
@@ -1404,6 +1406,7 @@ def list_authenticated_providers(
             })
             seen_slugs.add(ep_name.lower())
             seen_slugs.add(custom_provider_slug(display_name).lower())
+            seen_mdev_ids.add(normalized_ep_name)
             _pair = (
                 str(display_name).strip().lower(),
                 str(api_url).strip().rstrip("/").lower(),
@@ -1541,5 +1544,20 @@ def list_authenticated_providers(
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
+
+    # Make duplicate display names explicit so messaging clients that render
+    # p["name"] directly can still distinguish same-named providers.
+    name_counts: dict[str, int] = {}
+    for row in results:
+        name = str(row.get("name", "")).strip()
+        if name:
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+    if any(count > 1 for count in name_counts.values()):
+        for row in results:
+            name = str(row.get("name", "")).strip()
+            slug = str(row.get("slug", "")).strip()
+            if name and slug and name_counts.get(name, 0) > 1 and slug != name:
+                row["name"] = f"{name} ({slug})"
 
     return results

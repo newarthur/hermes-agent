@@ -1436,6 +1436,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         try:
+            # If there's an existing picker message for this chat, delete it first
+            # so we don't accumulate stale inline-keyboard messages.
+            old_state = self._model_picker_state.pop(str(chat_id), None)
+            if old_state and old_state.get("msg_id"):
+                try:
+                    await self._bot.delete_message(
+                        chat_id=int(chat_id),
+                        message_id=old_state["msg_id"],
+                    )
+                except Exception:
+                    pass  # Message may already be deleted or too old
+
             # Build provider buttons — 2 per row
             buttons: list = []
             for p in providers:
