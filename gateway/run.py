@@ -717,6 +717,75 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
 
+def _load_persona_model_routes(config: dict | None = None) -> dict:
+    """Return configured persona model routes.
+
+    Historically this install used top-level ``persona_model_routes`` while the
+    documented shape is ``agent.persona_model_routes``.  Accept both so existing
+    configs keep working; agent-scoped config wins when present.
+    """
+    cfg = config if config is not None else _load_gateway_config()
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    routes = agent_cfg.get("persona_model_routes")
+    if not isinstance(routes, dict) or not routes:
+        routes = cfg.get("persona_model_routes")
+    return routes if isinstance(routes, dict) else {}
+
+
+def _active_personality_name(config: dict | None = None) -> str | None:
+    cfg = config if config is not None else _load_gateway_config()
+    display_cfg = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+    name = str(display_cfg.get("personality") or "").strip().lower()
+    if name in ("", "none", "default", "neutral"):
+        return None
+    return name
+
+
+def _normalize_fallback_model(entry) -> list:
+    if isinstance(entry, dict):
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        return [entry] if provider and model else []
+    if isinstance(entry, list):
+        normalized = []
+        for item in entry:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip()
+            model = str(item.get("model") or "").strip()
+            if provider and model:
+                normalized.append(item)
+        return normalized
+    return []
+
+
+def _format_persona_route_lines(personality: str, config: dict | None = None) -> list[str]:
+    route = _load_persona_model_routes(config).get(personality)
+    if not isinstance(route, dict):
+        return []
+    lines = []
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    if provider or model:
+        lines.append(f"Primary: {provider or '(current provider)'} / {model or '(current model)'}")
+    fallback = _normalize_fallback_model(route.get("fallback_model"))
+    if fallback:
+        fb = fallback[0]
+        lines.append(f"Fallback: {fb.get('provider')} / {fb.get('model')}")
+    return lines
+
+
+def _runtime_kwargs_from_runtime(runtime: dict) -> dict:
+    return {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+    }
+
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
@@ -1304,7 +1373,46 @@ class GatewayRunner:
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs = None
+
+        # No session /model override: honor the active personality's configured
+        # model route before resolving the global runtime.  This lets a valid
+        # persona route recover even when global model.provider/default is stale.
+        if not override:
+            cfg = user_config if user_config is not None else _load_gateway_config()
+            personality = _active_personality_name(cfg)
+            route = _load_persona_model_routes(cfg).get(personality) if personality else None
+            if isinstance(route, dict):
+                route_provider = str(route.get("provider") or "").strip()
+                route_model = str(route.get("model") or "").strip()
+                fallback = _normalize_fallback_model(route.get("fallback_model"))
+                if fallback:
+                    self._fallback_model = fallback
+                try:
+                    if route_provider:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        runtime = resolve_runtime_provider(
+                            requested=route_provider,
+                            explicit_base_url=route.get("base_url"),
+                            explicit_api_key=route.get("api_key"),
+                        )
+                        runtime_kwargs = _runtime_kwargs_from_runtime(runtime)
+                    if route_model:
+                        model = route_model
+                    if runtime_kwargs is not None:
+                        logger.info(
+                            "Persona route applied: personality=%s provider=%s model=%s",
+                            personality, runtime_kwargs.get("provider"), model,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Persona route unavailable for %s (%s); trying current runtime",
+                        personality, exc,
+                    )
+
+        if runtime_kwargs is None:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -6807,7 +6915,10 @@ class GatewayRunner:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = ""
+                config["display"]["personality"] = "none"
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -6820,7 +6931,10 @@ class GatewayRunner:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
                 config["agent"]["system_prompt"] = new_prompt
+                config["display"]["personality"] = args
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -6828,7 +6942,9 @@ class GatewayRunner:
             # Update in-memory so it takes effect on the very next message.
             self._ephemeral_system_prompt = new_prompt
 
-            return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
+            route_lines = _format_persona_route_lines(args, config)
+            route_text = "\n" + "\n".join(route_lines) if route_lines else ""
+            return f"🎭 Personality set to **{args}**{route_text}\n_(takes effect on next message)_"
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"

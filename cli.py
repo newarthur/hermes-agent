@@ -1771,6 +1771,42 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     return parsed
 
 
+def _load_persona_model_routes_from_config(config: dict | None = None) -> dict:
+    """Return persona model routes from agent.persona_model_routes or legacy top-level key."""
+    cfg = config if config is not None else CLI_CONFIG
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    routes = agent_cfg.get("persona_model_routes")
+    if not isinstance(routes, dict) or not routes:
+        routes = cfg.get("persona_model_routes")
+    return routes if isinstance(routes, dict) else {}
+
+
+def _normalize_persona_fallback(entry) -> list:
+    if isinstance(entry, dict):
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        return [entry] if provider and model else []
+    if isinstance(entry, list):
+        return [e for e in entry if isinstance(e, dict) and str(e.get("provider") or "").strip() and str(e.get("model") or "").strip()]
+    return []
+
+
+def _format_cli_persona_route_lines(personality: str, config: dict | None = None) -> list[str]:
+    route = _load_persona_model_routes_from_config(config).get(personality)
+    if not isinstance(route, dict):
+        return []
+    lines = []
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    if provider or model:
+        lines.append(f"  Primary: {provider or '(current provider)'} / {model or '(current model)'}")
+    fallback = _normalize_persona_fallback(route.get("fallback_model"))
+    if fallback:
+        fb = fallback[0]
+        lines.append(f"  Fallback: {fb.get('provider')} / {fb.get('model')}")
+    return lines
+
+
 def save_config_value(key_path: str, value: any) -> bool:
     """
     Save a value to the active config file at the specified key path.
@@ -2058,6 +2094,25 @@ class HermesCLI:
         if isinstance(fb, dict):
             fb = [fb] if fb.get("provider") and fb.get("model") else []
         self._fallback_model = fb
+
+        # Apply the active persona route at startup.  Accept the documented
+        # agent.persona_model_routes and this install's legacy top-level key.
+        _display_cfg = CLI_CONFIG.get("display") if isinstance(CLI_CONFIG.get("display"), dict) else {}
+        _active_persona = str(_display_cfg.get("personality") or "").strip().lower()
+        if _active_persona not in ("", "none", "default", "neutral"):
+            _route = _load_persona_model_routes_from_config(CLI_CONFIG).get(_active_persona)
+            if isinstance(_route, dict):
+                _route_provider = str(_route.get("provider") or "").strip()
+                _route_model = str(_route.get("model") or "").strip()
+                if _route_provider and not provider:
+                    self.requested_provider = _route_provider
+                    self.provider = _route_provider
+                if _route_model and not model:
+                    self.model = _route_model
+                    self._model_is_default = False
+                _route_fb = _normalize_persona_fallback(_route.get("fallback_model"))
+                if _route_fb:
+                    self._fallback_model = _route_fb
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -5702,6 +5757,7 @@ class HermesCLI:
             if personality_name in ("none", "default", "neutral"):
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
+                save_config_value("display.personality", "none")
                 if save_config_value("agent.system_prompt", ""):
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
@@ -5709,12 +5765,30 @@ class HermesCLI:
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                _route = _load_persona_model_routes_from_config(CLI_CONFIG).get(personality_name)
+                if isinstance(_route, dict):
+                    _route_provider = str(_route.get("provider") or "").strip()
+                    _route_model = str(_route.get("model") or "").strip()
+                    if _route_provider:
+                        self.provider = _route_provider
+                        self.requested_provider = _route_provider
+                        save_config_value("model.provider", _route_provider)
+                    if _route_model:
+                        self.model = _route_model
+                        self._model_is_default = False
+                        save_config_value("model.default", _route_model)
+                    _route_fb = _normalize_persona_fallback(_route.get("fallback_model"))
+                    if _route_fb:
+                        self._fallback_model = _route_fb
                 self.agent = None  # Force re-init
+                save_config_value("display.personality", personality_name)
                 if save_config_value("agent.system_prompt", self.system_prompt):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
+                for _line in _format_cli_persona_route_lines(personality_name, CLI_CONFIG):
+                    print(_line)
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")

@@ -48,13 +48,37 @@ class TestCLIPersonalityNone:
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True) as mock_save:
             cli._handle_personality_command("/personality none")
-        mock_save.assert_called_once_with("agent.system_prompt", "")
+        mock_save.assert_any_call("agent.system_prompt", "")
+        mock_save.assert_any_call("display.personality", "none")
 
     def test_known_personality_still_works(self):
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True):
             cli._handle_personality_command("/personality helpful")
         assert cli.system_prompt == "You are helpful."
+
+    def test_known_personality_applies_persona_model_route(self):
+        cli = self._make_cli()
+        config = {
+            "agent": {
+                "persona_model_routes": {
+                    "helpful": {
+                        "provider": "test-primary",
+                        "model": "test-model",
+                        "fallback_model": {"provider": "test-fallback", "model": "fallback-model"},
+                    }
+                }
+            }
+        }
+        with patch("cli.CLI_CONFIG", config), patch("cli.save_config_value", return_value=True) as mock_save:
+            cli._handle_personality_command("/personality helpful")
+        assert cli.provider == "test-primary"
+        assert cli.requested_provider == "test-primary"
+        assert cli.model == "test-model"
+        assert cli._fallback_model == [{"provider": "test-fallback", "model": "fallback-model"}]
+        mock_save.assert_any_call("display.personality", "helpful")
+        mock_save.assert_any_call("model.provider", "test-primary")
+        mock_save.assert_any_call("model.default", "test-model")
 
     def test_unknown_personality_shows_none_in_available(self, capsys):
         cli = self._make_cli()
@@ -117,6 +141,38 @@ class TestGatewayPersonalityNone:
             result = await runner._handle_personality_command(event)
 
         assert runner._ephemeral_system_prompt == ""
+
+    def test_runtime_uses_active_persona_model_route(self):
+        runner = self._make_runner()
+        runner._fallback_model = None
+        runner._session_model_overrides = {}
+        config = {
+            "display": {"personality": "helpful"},
+            "model": {"provider": "stale-provider", "default": "stale-model"},
+            "agent": {
+                "personalities": {"helpful": "You are helpful."},
+                "persona_model_routes": {
+                    "helpful": {
+                        "provider": "test-primary",
+                        "model": "test-model",
+                        "fallback_model": {"provider": "test-fallback", "model": "fallback-model"},
+                    }
+                },
+            },
+        }
+        runtime = {
+            "provider": "test-primary",
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "openai",
+        }
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime):
+            model, runtime_kwargs = runner._resolve_session_agent_runtime(user_config=config)
+
+        assert model == "test-model"
+        assert runtime_kwargs["provider"] == "test-primary"
+        assert runtime_kwargs["base_url"] == "https://example.invalid/v1"
+        assert runner._fallback_model == [{"provider": "test-fallback", "model": "fallback-model"}]
 
     @pytest.mark.asyncio
     async def test_list_includes_none(self, tmp_path):
