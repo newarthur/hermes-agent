@@ -347,6 +347,9 @@ git show 117a26936 -- hermes_cli/runtime_provider.py | git apply -
 # gateway/platforms/telegram.py - picker 清理
 git show 117a26936 -- gateway/platforms/telegram.py | git apply -
 
+# 新增：统一的 Gemini 修复补丁 (包含 OAuth 登录格式兼容、属性报错追踪及缺失内容修复)
+git apply /root/.hermes/hermes-agent-patches/gemini-all-fixes.patch
+
 # 3. 修复测试
 # tests/hermes_cli/test_user_providers_model_switch.py
 git show 74e6528d3 -- tests/hermes_cli/test_user_providers_model_switch.py | git apply -

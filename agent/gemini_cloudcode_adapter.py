@@ -387,6 +387,9 @@ def _translate_gemini_response(
         reasoning_content="".join(reasoning_pieces) or None,
         reasoning_details=None,
     )
+    # The error says "'types.SimpleNamespace' object has no attribute 'content'"
+    # Wait, the error comes from where? "📝 Error: 'types.SimpleNamespace' object has no attribute 'content'"
+    # Let me search where this error comes from.
     choice = SimpleNamespace(
         index=0,
         message=message,
@@ -450,9 +453,11 @@ def _make_stream_chunk(
     finish_reason: Optional[str] = None,
     reasoning: str = "",
 ) -> _GeminiStreamChunk:
-    delta_kwargs: Dict[str, Any] = {"role": "assistant"}
-    if content:
-        delta_kwargs["content"] = content
+    delta_kwargs: Dict[str, Any] = {
+        "role": "assistant",
+        "content": content if content else None,
+        "tool_calls": None,
+    }
     if tool_call_delta is not None:
         delta_kwargs["tool_calls"] = [SimpleNamespace(
             index=tool_call_delta.get("index", 0),
