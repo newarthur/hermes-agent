@@ -1473,7 +1473,14 @@ def convert_messages_to_anthropic(
             # signed thinking blocks — adding another unsigned one from
             # reasoning_content would create a duplicate (same text) that gets
             # downgraded to a spurious text block on the last assistant message.
-            reasoning_content = m.get("reasoning_content")
+            reasoning_content = m.get("reasoning_content") or m.get("reasoning")
+            # Kimi fallback: if this is a tool-call message and we are going to Kimi,
+            # Kimi requires reasoning_content (Anthropic thinking block).
+            # We ensure it's at least an empty string if the message has tool calls.
+            if _is_kimi_family_endpoint(base_url, model) and m.get("tool_calls"):
+                if reasoning_content is None:
+                    reasoning_content = ""
+
             _already_has_thinking = any(
                 isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
                 for b in blocks

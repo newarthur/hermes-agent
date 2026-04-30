@@ -10,8 +10,8 @@
 
 核心保留策略：
 
-1. 保留 Kimi Coding Plan 核心修复，避免 `api.kimi.com/coding/v1` 被回退到 legacy Moonshot，避免 Anthropic SDK 请求 `/coding/v1/v1/messages` 导致 auxiliary/title generation HTTP 404。
-2. 保留 Gemini CLI / CloudCode 兼容修复，包括 `cloudcode-pa://`、Gemini CLI OAuth credential 格式、stream chunk delta 属性。
+1. 保留 Kimi Coding Plan 核心修复，避免 `api.kimi.com/coding/v1` 被回退到 legacy Moonshot，避免 Anthropic SDK 请求 `/coding/v1/v1/messages` 导致 auxiliary/title generation HTTP 404；同时保留 Kimi reasoning/content padding，避免跨 Provider 降级到 Kimi 时历史 tool-call 消息触发 HTTP 400。
+2. 保留 Gemini CLI / CloudCode 兼容修复，包括 `cloudcode-pa://`、Gemini CLI OAuth credential 格式、stream chunk delta 属性，以及 Code Assist tool-use/functionResponse 历史组织。
 3. 保留 persona model routes：CLI/Gateway 切换 personality 时同步切换 provider/model/fallback，并兼容 `agent.persona_model_routes` 与历史顶层 `persona_model_routes`。
 4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
 
@@ -42,9 +42,9 @@
 |------|-----|
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch` |
 | 优先级 | critical |
-| 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化 |
+| 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化、Kimi tool-call reasoning/content padding |
 | 上游冲突 | 上游可能恢复 Moonshot endpoint 或缺少 Kimi Coding 双端点处理 |
-| 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404 |
+| 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404，以及跨 Provider 降级到 Kimi 时 tool-call 历史消息 HTTP 400 |
 
 包含文件：
 
@@ -53,6 +53,9 @@
 - `hermes_cli/runtime_provider.py`
 - `agent/anthropic_adapter.py`
 - `tests/hermes_cli/test_timeouts.py`
+- `tests/hermes_cli/test_api_key_providers.py`
+- `tests/hermes_cli/test_user_providers_model_switch.py`
+- `agent/models_dev.py`
 
 关键行为：
 
@@ -71,6 +74,7 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 - `anthropic_messages` 路径传入 Anthropic SDK 前使用 `https://api.kimi.com/coding`。
 - stale `chat_completions` 不会覆盖 Kimi Coding 的 URL 检测结果。
 - `tests/hermes_cli/test_timeouts.py::test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk` 通过。
+- Kimi 家族 endpoint 上，包含工具调用的 assistant 历史消息缺少 reasoning 内容时会补空字符串，避免 Kimi 400。
 
 ---
 
@@ -80,15 +84,17 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 |------|-----|
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch` |
 | 优先级 | critical（继续使用 Gemini CLI 时） |
-| 修改类型 | Gemini CLI endpoint/OAuth/CloudCode stream 兼容 |
+| 修改类型 | Gemini CLI endpoint/OAuth/CloudCode stream 兼容、Code Assist tool-use/functionResponse 历史组织 |
 | 上游冲突 | 上游可能使用 Hermes 自有 Google OAuth 格式，不兼容 Gemini CLI credential 文件 |
-| 保留理由 | 用户偏好交互式 OAuth/PKCE；需要 Hermes 与 Gemini CLI credential 互操作 |
+| 保留理由 | 用户偏好交互式 OAuth/PKCE；需要 Hermes 与 Gemini CLI credential 互操作；Gemini Code Assist 要求 functionResponse parts 与前一轮 functionCall parts 一一匹配 |
 
 包含文件：
 
 - `agent/model_metadata.py`
 - `agent/gemini_cloudcode_adapter.py`
 - `agent/google_oauth.py`
+- `hermes_cli/models.py`
+- `tests/agent/test_gemini_cloudcode.py`
 
 关键行为：
 
@@ -115,6 +121,7 @@ expires_ms = data.get("expiry_date") or data.get("expires")
 - `cloudcode-pa://google` 能被识别为 Gemini provider。
 - `~/.gemini/oauth_creds.json` 可被 Hermes 读取。
 - CloudCode stream delta 带 `content` 和 `tool_calls` 属性。
+- 连续 tool-role 消息会合并为一个 Gemini user turn，functionResponse parts 数量匹配前一轮 functionCall parts。
 
 ---
 
@@ -185,6 +192,7 @@ if old_state and old_state.get("msg_id"):
 - Telegram 打开新的 model picker 前，会尝试删除同 chat 的旧 picker message。
 - 删除失败时静默忽略，不影响新 picker 发送。
 
+
 ---
 
 ## 旧 8 项文件级补丁映射
@@ -235,14 +243,16 @@ python3 -m py_compile \
   cli.py gateway/run.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
-  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
+  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
+  hermes_cli/runtime_provider.py \
   gateway/platforms/telegram.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
-  tests/hermes_cli/test_timeouts.py -q
+  tests/hermes_cli/test_timeouts.py \
+  tests/agent/test_gemini_cloudcode.py -q
 ```
 
 ### 手动恢复步骤
@@ -268,14 +278,16 @@ python3 -m py_compile \
   cli.py gateway/run.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
-  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
+  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
+  hermes_cli/runtime_provider.py \
   gateway/platforms/telegram.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
-  tests/hermes_cli/test_timeouts.py -q
+  tests/hermes_cli/test_timeouts.py \
+  tests/agent/test_gemini_cloudcode.py -q
 ```
 
 ---
@@ -288,6 +300,7 @@ PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
 | 2026-04-30 | 新增 `gemini-all-fixes.patch` 为正式恢复项 |
 | 2026-04-30 | 新增 Kimi Coding Anthropic SDK URL 归一化，修复 title generation 404 |
 | 2026-04-30 | 从 8 个文件级 patch 精简为 4 个功能级 patch；保留 Kimi/Gemini 核心修复和 openai-codex-only picker 策略 |
+| 2026-04-30 | 将 `05-kimi-reasoning-content-padding.patch` 合并进 `01-kimi-coding-plan-runtime.patch`，将 Gemini Code Assist tool-use 补丁合并进 `02-gemini-cli-cloudcode-compat.patch` |
 
 ---
 

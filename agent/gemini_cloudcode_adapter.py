@@ -105,15 +105,22 @@ def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _translate_tool_result_to_gemini(message: Dict[str, Any]) -> Dict[str, Any]:
+def _translate_tool_result_to_gemini(
+    message: Dict[str, Any],
+    tool_call_name_by_id: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """OpenAI tool-role message -> Gemini functionResponse part.
 
-    The function name isn't in the OpenAI tool message directly; it must be
-    passed via the assistant message that issued the call. For simplicity we
-    look up ``name`` on the message (OpenAI SDK copies it there) or on the
-    ``tool_call_id`` cross-reference.
+    Hermes stores tool results with ``tool_call_id`` but not always ``name``.
+    Gemini/Code Assist requires ``functionResponse.name`` to match the original
+    ``functionCall.name``, so resolve it from the preceding assistant turn's
+    tool_calls when available.
     """
-    name = str(message.get("name") or message.get("tool_call_id") or "tool")
+    tool_call_id = str(message.get("tool_call_id") or "")
+    resolved_name = None
+    if tool_call_id and tool_call_name_by_id:
+        resolved_name = tool_call_name_by_id.get(tool_call_id)
+    name = str(message.get("name") or resolved_name or tool_call_id or "tool")
     content = _coerce_content_to_text(message.get("content"))
     # Gemini expects the response as a dict under `response`. We wrap plain
     # text in {"output": "..."}.
@@ -133,11 +140,24 @@ def _translate_tool_result_to_gemini(message: Dict[str, Any]) -> Dict[str, Any]:
 def _build_gemini_contents(
     messages: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Convert OpenAI messages[] to Gemini contents[] + systemInstruction."""
+    """Convert OpenAI messages[] to Gemini contents[] + systemInstruction.
+
+    Code Assist is stricter than OpenAI-compatible chat APIs about tool result
+    history: a model turn containing N ``functionCall`` parts must be followed
+    by one user turn containing the matching N ``functionResponse`` parts.  Do
+    not emit consecutive tool messages as separate user turns, otherwise Code
+    Assist rejects the request with:
+    "Please ensure that the number of function response parts is equal to the
+    number of function call parts of the function call turn."
+    """
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
+    tool_call_name_by_id: Dict[str, str] = {}
 
-    for msg in messages:
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        i += 1
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "user")
@@ -146,11 +166,22 @@ def _build_gemini_contents(
             system_text_parts.append(_coerce_content_to_text(msg.get("content")))
             continue
 
-        # Tool result message — emit a user-role turn with functionResponse
+        # Tool result messages must be grouped into a single functionResponse
+        # turn when they answer a multi-call assistant turn.
         if role == "tool" or role == "function":
+            response_parts = [_translate_tool_result_to_gemini(msg, tool_call_name_by_id)]
+            while i < len(messages):
+                next_msg = messages[i]
+                if not isinstance(next_msg, dict):
+                    break
+                next_role = str(next_msg.get("role") or "user")
+                if next_role not in ("tool", "function"):
+                    break
+                response_parts.append(_translate_tool_result_to_gemini(next_msg, tool_call_name_by_id))
+                i += 1
             contents.append({
                 "role": "user",
-                "parts": [_translate_tool_result_to_gemini(msg)],
+                "parts": response_parts,
             })
             continue
 
@@ -166,6 +197,11 @@ def _build_gemini_contents(
         if isinstance(tool_calls, list):
             for tc in tool_calls:
                 if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    tool_call_id = tc.get("id")
+                    fn_name = fn.get("name")
+                    if tool_call_id and fn_name:
+                        tool_call_name_by_id[str(tool_call_id)] = str(fn_name)
                     parts.append(_translate_tool_call_to_gemini(tc))
 
         if not parts:
@@ -387,9 +423,6 @@ def _translate_gemini_response(
         reasoning_content="".join(reasoning_pieces) or None,
         reasoning_details=None,
     )
-    # The error says "'types.SimpleNamespace' object has no attribute 'content'"
-    # Wait, the error comes from where? "📝 Error: 'types.SimpleNamespace' object has no attribute 'content'"
-    # Let me search where this error comes from.
     choice = SimpleNamespace(
         index=0,
         message=message,

@@ -635,6 +635,57 @@ class TestBuildGeminiRequest:
         assert fr_part["functionResponse"]["name"] == "get_weather"
         assert fr_part["functionResponse"]["response"] == {"temp": 72}
 
+    def test_multiple_tool_results_grouped_for_code_assist(self):
+        from agent.gemini_cloudcode_adapter import build_gemini_request
+
+        req = build_gemini_request(messages=[
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "tool_calls": [
+                {
+                    "id": "c1", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+                },
+                {
+                    "id": "c2", "type": "function",
+                    "function": {"name": "search_files", "arguments": '{"pattern":"x"}'},
+                },
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": '{"content":"A"}'},
+            {"role": "tool", "tool_call_id": "c2", "content": '{"matches":[]}'},
+        ])
+
+        assert len(req["contents"]) == 3
+        call_turn = req["contents"][1]
+        response_turn = req["contents"][2]
+        call_parts = [p for p in call_turn["parts"] if "functionCall" in p]
+        response_parts = [p for p in response_turn["parts"] if "functionResponse" in p]
+        assert len(call_parts) == 2
+        assert len(response_parts) == 2
+        assert response_turn["role"] == "user"
+        assert [p["functionResponse"]["name"] for p in response_parts] == [
+            "read_file", "search_files",
+        ]
+        assert response_parts[0]["functionResponse"]["response"] == {"content": "A"}
+        assert response_parts[1]["functionResponse"]["response"] == {"matches": []}
+
+    def test_multiple_tool_results_split_by_non_tool_turn(self):
+        from agent.gemini_cloudcode_adapter import build_gemini_request
+
+        req = build_gemini_request(messages=[
+            {"role": "assistant", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "fn1", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "c1", "content": "one"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "two"},
+        ])
+
+        assert len(req["contents"][1]["parts"]) == 1
+        assert req["contents"][1]["parts"][0]["functionResponse"]["name"] == "fn1"
+        assert len(req["contents"][3]["parts"]) == 1
+        assert req["contents"][3]["parts"][0]["functionResponse"]["name"] == "orphan"
+
     def test_tools_translated_to_function_declarations(self):
         from agent.gemini_cloudcode_adapter import build_gemini_request
 
