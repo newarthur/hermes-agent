@@ -19,6 +19,11 @@
 
 ## Patch 文件清单
 
+> **统一存放位置**: `~/.hermes/hermes-agent-patches/by-file/`
+>
+> 所有按文件拆分的 patch 都集中存放在此目录，便于管理和版本控制。
+> 外部复合补丁（如 `gemini-all-fixes.patch`）仍保留在父目录。
+
 ### 1. `agent/model_metadata.py`
 
 | 属性 | 值 |
@@ -377,6 +382,7 @@ def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch)
 # restore-local-patches.sh
 # 在上游 sync 后执行（skill 完成后）
 
+PATCH_DIR="/root/.hermes/hermes-agent-patches/by-file"
 cd ~/.hermes/hermes-agent
 
 echo "=== 恢复本地 Patch ==="
@@ -387,31 +393,19 @@ if grep -r "<<<<<<< HEAD" agent/ hermes_cli/ gateway/ 2>/dev/null; then
     exit 1
 fi
 
-# 2. 应用各文件的 patch
-# agent/model_metadata.py - Gemini CLI
-git show 117a26936 -- agent/model_metadata.py | git apply -
+# 2. 应用各文件的 patch（统一从 by-file 目录）
+git apply "$PATCH_DIR/agent_model_metadata.py.patch"          # Gemini CLI
+git apply "$PATCH_DIR/agent_models_dev.py.patch"             # 移除 openai
+git apply "$PATCH_DIR/hermes_cli_auth.py.patch"              # Kimi Coding Plan
+git apply "$PATCH_DIR/hermes_cli_model_switch.py.patch"      # 去重 + Kimi
+git apply "$PATCH_DIR/hermes_cli_runtime_provider.py.patch"  # api_mode 检测
+git apply "$PATCH_DIR/gateway_platforms_telegram.py.patch"     # picker 清理
 
-# agent/models_dev.py - 移除 openai
-git show 117a26936 -- agent/models_dev.py | git apply -
-
-# hermes_cli/auth.py - Kimi Coding Plan
-git show 117a26936 -- hermes_cli/auth.py | git apply -
-
-# hermes_cli/model_switch.py - 去重 + Kimi
-git show 117a26936 -- hermes_cli/model_switch.py | git apply -
-
-# hermes_cli/runtime_provider.py - api_mode 检测
-git show 117a26936 -- hermes_cli/runtime_provider.py | git apply -
-
-# gateway/platforms/telegram.py - picker 清理
-git show 117a26936 -- gateway/platforms/telegram.py | git apply -
-
-# 新增：统一的 Gemini 修复补丁 (包含 OAuth 登录格式兼容、属性报错追踪及缺失内容修复)
+# 3. 应用 Gemini 统一修复补丁
 git apply /root/.hermes/hermes-agent-patches/gemini-all-fixes.patch
 
-# 3. 修复测试
-# tests/hermes_cli/test_user_providers_model_switch.py
-git show 74e6528d3 -- tests/hermes_cli/test_user_providers_model_switch.py | git apply -
+# 4. 修复测试
+git apply "$PATCH_DIR/tests_hermes_cli_test_user_providers_model_switch_test-fix.patch"
 
 echo "=== 验证 ==="
 python -m pytest tests/hermes_cli/test_user_providers_model_switch.py tests/hermes_cli/test_models.py -q
