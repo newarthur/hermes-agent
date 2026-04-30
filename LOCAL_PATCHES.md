@@ -1,7 +1,7 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-04-29
+> 最后更新: 2026-04-30
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
@@ -259,6 +259,65 @@ try:
 
 ---
 
+### 7. `gemini-all-fixes.patch` (外部补丁文件)
+
+| 属性 | 值 |
+|------|-----|
+| **文件位置** | `/root/.hermes/hermes-agent-patches/gemini-all-fixes.patch` |
+| **修改类型** | Gemini CLI OAuth 格式兼容 + 流式响应属性修复 |
+| **上游冲突** | 🔴 上游使用不同的 OAuth 凭证格式 |
+| **保留理由** | 使 Hermes 的 Google OAuth 与 Gemini CLI 的 `~/.gemini/oauth_creds.json` 格式互操作；修复流式响应中 `SimpleNamespace` 缺少 `content` 属性导致的报错 |
+
+**Patch 内容**:
+
+**A. `agent/gemini_cloudcode_adapter.py` — 流式响应修复**:
+```python
+# 修复 _make_stream_chunk 中 delta 对象缺少 content/tool_calls 属性
+delta_kwargs: Dict[str, Any] = {
+    "role": "assistant",
+    "content": content if content else None,
+    "tool_calls": None,
+}
+if tool_call_delta is not None:
+    delta_kwargs["tool_calls"] = [SimpleNamespace(...)]
+```
+
+**B. `agent/google_oauth.py` — OAuth 凭证路径与格式兼容**:
+```python
+def _credentials_path() -> Path:
+    # 使用 Gemini CLI 的凭证路径，实现互操作
+    return Path.home() / ".gemini" / "oauth_creds.json"
+
+class GoogleCredentials:
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expiry_date": int(self.expires_ms),
+            "token_type": "Bearer",
+            "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cloud-platform openid",
+            "refresh": RefreshParts(...).format(),
+            "email": self.email,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GoogleCredentials":
+        # 同时支持 Gemini CLI 格式 (access_token/refresh_token/expiry_date)
+        # 和 Hermes 旧格式 (access/expires)
+        refresh_packed = str(data.get("refresh", "") or "")
+        parts = RefreshParts.parse(refresh_packed)
+        return cls(
+            access_token=str(data.get("access_token", "") or data.get("access", "") or ""),
+            refresh_token=str(data.get("refresh_token", "") or parts.refresh_token or ""),
+            expires_ms=int(data.get("expiry_date", 0) or data.get("expires", 0) or 0),
+            email=str(data.get("email", "") or ""),
+            project_id=parts.project_id,
+            managed_project_id=parts.managed_project_id,
+        )
+```
+
+---
+
 ## 测试适配
 
 ### 需要修改的测试文件
@@ -397,6 +456,7 @@ git commit -m "restore: re-apply high-value local patches after upstream sync ($
 |------|--------|------|
 | 2026-04-29 | `117a269` | 首次整理并文档化本地 patch |
 | 2026-04-29 | `74e6528` | 适配测试：openai → openai-codex OAuth |
+| 2026-04-30 | — | 新增 `gemini-all-fixes.patch` 为独立 Patch 条目（已在恢复脚本中引用，现补充文档说明） |
 
 ---
 
