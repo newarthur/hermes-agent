@@ -12,8 +12,10 @@
 
 1. 保留 Kimi Coding Plan 核心修复，避免 `api.kimi.com/coding/v1` 被回退到 legacy Moonshot，避免 Anthropic SDK 请求 `/coding/v1/v1/messages` 导致 auxiliary/title generation HTTP 404。
 2. 保留 Gemini CLI / CloudCode 兼容修复，包括 `cloudcode-pa://`、Gemini CLI OAuth credential 格式、stream chunk delta 属性。
-3. 保持本机 Hermes picker 干净：只显示 `openai-codex`，不恢复独立 `openai` provider；同时保留 provider alias 去重和重复显示名 disambiguation。
+3. 保留 persona model routes：CLI/Gateway 切换 personality 时同步切换 provider/model/fallback，并兼容 `agent.persona_model_routes` 与历史顶层 `persona_model_routes`。
 4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
+
+补充：provider picker 去重、本机 `openai-codex` 策略已合并进 `01-kimi-coding-plan-runtime.patch`，不再单独维护 `03-provider-picker-dedup-and-local-policy.patch`。
 
 统一主目录：
 
@@ -22,7 +24,7 @@
 ├── by-feature/
 │   ├── 01-kimi-coding-plan-runtime.patch
 │   ├── 02-gemini-cli-cloudcode-compat.patch
-│   ├── 03-provider-picker-dedup-and-local-policy.patch
+│   ├── 03-persona-model-routing.patch
 │   └── 04-telegram-model-picker-cleanup.patch
 ├── by-file/                         # 历史参考；不再作为主恢复入口
 └── restore-local-patches.sh          # 当前恢复脚本，应用 4 个功能 patch
@@ -116,43 +118,43 @@ expires_ms = data.get("expiry_date") or data.get("expires")
 
 ---
 
-### 3. `03-provider-picker-dedup-and-local-policy.patch`
+### 3. `03-persona-model-routing.patch`
 
 | 属性 | 值 |
 |------|-----|
-| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/03-provider-picker-dedup-and-local-policy.patch` |
-| 优先级 | warning，但按用户要求保留 |
-| 修改类型 | Provider picker 去重、本机 provider 策略、测试适配 |
-| 上游冲突 | 上游可能恢复独立 `openai` provider 或移除 alias 去重逻辑 |
-| 保留理由 | 保持本机 Hermes picker 干净且只用 `openai-codex`，不显示普通 `openai` provider |
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/03-persona-model-routing.patch` |
+| 优先级 | critical（多人格路由依赖） |
+| 修改类型 | personality 切换时应用 provider/model/fallback route；Gateway 启动 agent 时按当前 personality 解析 runtime |
+| 上游冲突 | 上游可能只保存 `agent.system_prompt`，不按 personality 同步切换 provider/model/fallback |
+| 保留理由 | Hermes 主 bot 依赖 hermes_main/hermes_osahs/hermes_ops 三人格路由；不同人格需要稳定使用各自配置的模型与 fallback |
 
 包含文件：
 
-- `agent/models_dev.py`
-- `hermes_cli/model_switch.py` 中 provider alias 去重和重复显示名处理
-- `tests/hermes_cli/test_user_providers_model_switch.py`
+- `cli.py`
+- `gateway/run.py`
+- `tests/cli/test_personality_none.py`
 
 关键行为：
 
 ```python
-PROVIDER_TO_MODELS_DEV = {
-    "openai-codex": "openai",
-    # 不恢复 "openai": "openai"
-}
+# 同时兼容 documented agent.persona_model_routes 和历史顶层 persona_model_routes
+routes = agent_cfg.get("persona_model_routes")
+if not isinstance(routes, dict) or not routes:
+    routes = cfg.get("persona_model_routes")
 ```
 
 ```python
-normalized_ep_name = normalize_provider(ep_name)
-if ep_name.lower() in seen_slugs or normalized_ep_name in seen_mdev_ids:
-    continue
+# /personality 切换时同步 provider/model/fallback，并保存 display.personality
+save_config_value("display.personality", personality_name)
 ```
 
 验证点：
 
-- picker 中只出现 `openai-codex`，不出现独立 `openai`。
-- provider alias 不重复显示。
-- 重复 display name 会追加 slug 以便 Telegram/Web UI 区分。
-- `tests/hermes_cli/test_user_providers_model_switch.py` 通过。
+- CLI 启动时能按 `display.personality` 应用 persona route。
+- CLI `/personality none` 会持久化清空 `display.personality`。
+- Gateway 没有 session `/model` override 时优先使用当前 personality 的 route。
+- `tests/cli/test_personality_none.py` 通过。
+
 
 ---
 
@@ -195,9 +197,9 @@ if old_state and old_state.get("msg_id"):
 | `by-file/hermes_cli_runtime_provider.py.patch` | `01-kimi-coding-plan-runtime.patch` |
 | `by-file/agent_anthropic_adapter.py.patch` | `01-kimi-coding-plan-runtime.patch` |
 | `by-file/tests_hermes_cli_test_timeouts_kimi_anthropic_base_url.patch` | `01-kimi-coding-plan-runtime.patch` |
-| `by-file/agent_models_dev.py.patch` | `03-provider-picker-dedup-and-local-policy.patch` |
-| `by-file/hermes_cli_model_switch.py.patch` | 拆分到 `01` 和 `03` |
-| `by-file/tests_hermes_cli_test_user_providers_model_switch_test-fix.patch` | `03-provider-picker-dedup-and-local-policy.patch` |
+| `by-file/agent_models_dev.py.patch` | `01-kimi-coding-plan-runtime.patch`（provider local policy 已并入 01） |
+| `by-file/hermes_cli_model_switch.py.patch` | `01-kimi-coding-plan-runtime.patch` |
+| `by-file/tests_hermes_cli_test_user_providers_model_switch_test-fix.patch` | `01-kimi-coding-plan-runtime.patch` |
 | `by-file/gateway_platforms_telegram.py.patch` | `04-telegram-model-picker-cleanup.patch` |
 
 ---
@@ -223,19 +225,21 @@ cd /root/.hermes/hermes-agent
 
 1. `01-kimi-coding-plan-runtime.patch`
 2. `02-gemini-cli-cloudcode-compat.patch`
-3. `03-provider-picker-dedup-and-local-policy.patch`
+3. `03-persona-model-routing.patch`
 4. `04-telegram-model-picker-cleanup.patch`
 
 然后执行：
 
 ```bash
 python3 -m py_compile \
+  cli.py gateway/run.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
   gateway/platforms/telegram.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+  tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
   tests/hermes_cli/test_timeouts.py -q
@@ -257,16 +261,18 @@ PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
 ```bash
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-provider-picker-dedup-and-local-policy.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-persona-model-routing.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch
 
 python3 -m py_compile \
+  cli.py gateway/run.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
   gateway/platforms/telegram.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+  tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
   tests/hermes_cli/test_timeouts.py -q
