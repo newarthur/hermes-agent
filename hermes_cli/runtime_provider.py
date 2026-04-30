@@ -265,8 +265,6 @@ def _resolve_runtime_from_pool_entry(
             # Kimi Coding's /coding endpoint only works through Anthropic Messages;
             # ignore stale chat_completions persisted by older switch flows.
             api_mode = detected
-        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-            api_mode = configured_mode
         elif provider in ("opencode-zen", "opencode-go"):
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
@@ -275,6 +273,8 @@ def _resolve_runtime_from_pool_entry(
             # Refs #16878.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
+        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+            api_mode = configured_mode
         elif detected:
             api_mode = detected
 

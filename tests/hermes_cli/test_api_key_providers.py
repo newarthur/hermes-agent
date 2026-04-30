@@ -36,7 +36,7 @@ class TestProviderRegistry:
         ("zai", "Z.AI / GLM", "api_key"),
         ("xai", "xAI", "api_key"),
         ("nvidia", "NVIDIA NIM", "api_key"),
-        ("kimi-coding", "Kimi / Moonshot", "api_key"),
+        ("kimi-coding", "Kimi / Kimi Coding Plan", "api_key"),
         ("stepfun", "StepFun Step Plan", "api_key"),
         ("minimax", "MiniMax", "api_key"),
         ("minimax-cn", "MiniMax (China)", "api_key"),
@@ -121,7 +121,7 @@ class TestProviderRegistry:
         assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
         assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
-        assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == "https://api.moonshot.ai/v1"
+        assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == KIMI_CODE_BASE_URL
         assert PROVIDER_REGISTRY["stepfun"].inference_base_url == STEPFUN_STEP_PLAN_INTL_BASE_URL
         assert PROVIDER_REGISTRY["minimax"].inference_base_url == "https://api.minimax.io/anthropic"
         assert PROVIDER_REGISTRY["minimax-cn"].inference_base_url == "https://api.minimaxi.com/anthropic"
@@ -496,7 +496,7 @@ class TestResolveApiKeyProviderCredentials:
         creds = resolve_api_key_provider_credentials("kimi-coding")
         assert creds["provider"] == "kimi-coding"
         assert creds["api_key"] == "kimi-secret-key"
-        assert creds["base_url"] == "https://api.moonshot.ai/v1"
+        assert creds["base_url"] == KIMI_CODE_BASE_URL
 
     def test_resolve_stepfun_with_key(self, monkeypatch):
         monkeypatch.setenv("STEPFUN_API_KEY", "stepfun-secret-key")
@@ -611,8 +611,9 @@ class TestRuntimeProviderResolution:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         result = resolve_runtime_provider(requested="kimi-coding")
         assert result["provider"] == "kimi-coding"
-        assert result["api_mode"] == "chat_completions"
+        assert result["api_mode"] == "anthropic_messages"
         assert result["api_key"] == "kimi-key"
+        assert result["base_url"] == "https://api.kimi.com/coding"
 
     def test_runtime_stepfun(self, monkeypatch):
         monkeypatch.setenv("STEPFUN_API_KEY", "stepfun-key")
@@ -937,11 +938,11 @@ class TestKimiCodeStatusAutoDetect:
         assert status["configured"] is True
         assert status["base_url"] == KIMI_CODE_BASE_URL
 
-    def test_legacy_key_gets_moonshot_url(self, monkeypatch):
-        monkeypatch.setenv("KIMI_API_KEY", "sk-legacy-test-key")
+    def test_legacy_key_uses_provider_default(self, monkeypatch):
+        monkeypatch.setenv("KIMI_API_KEY", "sk-leg...-key")
         status = get_api_key_provider_status("kimi-coding")
         assert status["configured"] is True
-        assert status["base_url"] == MOONSHOT_DEFAULT_URL
+        assert status["base_url"] == KIMI_CODE_BASE_URL
 
     def test_env_override_wins(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-test-key")
@@ -959,11 +960,11 @@ class TestKimiCodeCredentialAutoDetect:
         assert creds["api_key"] == "sk-kimi-secret-key"
         assert creds["base_url"] == KIMI_CODE_BASE_URL
 
-    def test_legacy_key_gets_moonshot_url(self, monkeypatch):
-        monkeypatch.setenv("KIMI_API_KEY", "sk-legacy-secret-key")
+    def test_legacy_key_uses_provider_default(self, monkeypatch):
+        monkeypatch.setenv("KIMI_API_KEY", "sk-leg...-key")
         creds = resolve_api_key_provider_credentials("kimi-coding")
-        assert creds["api_key"] == "sk-legacy-secret-key"
-        assert creds["base_url"] == MOONSHOT_DEFAULT_URL
+        assert creds["api_key"] == "sk-leg...-key"
+        assert creds["base_url"] == KIMI_CODE_BASE_URL
 
     def test_env_override_wins(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-secret-key")
