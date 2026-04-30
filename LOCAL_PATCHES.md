@@ -6,461 +6,288 @@
 
 ## 概述
 
-本仓库在 NousResearch/hermes-agent 上游基础上维护了以下本地 patch。这些 patch 主要服务于：
+本仓库在 NousResearch/hermes-agent 上游基础上维护 4 个功能级本地 patch。目标是让每次 upstream sync 后恢复动作更少、更不容易漏掉跨文件依赖。
 
-1. **Kimi Coding Plan 端点迁移** — 从 legacy Moonshot (`api.moonshot.ai/v1`) 迁移到 Kimi Coding Plan (`api.kimi.com/coding/v1`)
-2. **Provider 去重与别名规范化** — 防止 model picker 中出现重复 provider 条目
-3. **Telegram 交互优化** — 防止 model picker 消息累积
-4. **Gemini CLI 支持** — 处理 `cloudcode-pa://` 协议
+核心保留策略：
 
-⚠️ **重要**: 这些 patch 与上游方向存在冲突（上游已撤销部分修改），每次 sync 后需要手动 re-apply。
+1. 保留 Kimi Coding Plan 核心修复，避免 `api.kimi.com/coding/v1` 被回退到 legacy Moonshot，避免 Anthropic SDK 请求 `/coding/v1/v1/messages` 导致 auxiliary/title generation HTTP 404。
+2. 保留 Gemini CLI / CloudCode 兼容修复，包括 `cloudcode-pa://`、Gemini CLI OAuth credential 格式、stream chunk delta 属性。
+3. 保持本机 Hermes picker 干净：只显示 `openai-codex`，不恢复独立 `openai` provider；同时保留 provider alias 去重和重复显示名 disambiguation。
+4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
+
+统一主目录：
+
+```text
+/root/.hermes/hermes-agent-patches/
+├── by-feature/
+│   ├── 01-kimi-coding-plan-runtime.patch
+│   ├── 02-gemini-cli-cloudcode-compat.patch
+│   ├── 03-provider-picker-dedup-and-local-policy.patch
+│   └── 04-telegram-model-picker-cleanup.patch
+├── by-file/                         # 历史参考；不再作为主恢复入口
+└── restore-local-patches.sh          # 当前恢复脚本，应用 4 个功能 patch
+```
+
+重要：以后恢复以 `by-feature/` 为准。`by-file/` 仅保留作历史 diff/debug 参考，不要再把它当主清单。
 
 ---
 
-## Patch 文件清单
+## Patch 文件清单（4 个功能级 patch）
 
-> **统一存放位置**: `~/.hermes/hermes-agent-patches/by-file/`
->
-> 所有按文件拆分的 patch 都集中存放在此目录，便于管理和版本控制。
-> 外部复合补丁（如 `gemini-all-fixes.patch`）仍保留在父目录。
-
-### 1. `agent/model_metadata.py`
+### 1. `01-kimi-coding-plan-runtime.patch`
 
 | 属性 | 值 |
 |------|-----|
-| **修改类型** | 添加 Gemini CLI 协议支持 |
-| **上游冲突** | 🔴 上游已移除 `cloudcode-pa://` 处理 |
-| **保留理由** | Gemini CLI 使用 `cloudcode-pa://` 协议，需要转换为 HTTPS |
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch` |
+| 优先级 | critical |
+| 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化 |
+| 上游冲突 | 上游可能恢复 Moonshot endpoint 或缺少 Kimi Coding 双端点处理 |
+| 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404 |
 
-**Patch 内容**:
+包含文件：
+
+- `hermes_cli/auth.py`
+- `hermes_cli/model_switch.py` 中 Kimi `/v1` 剥离逻辑
+- `hermes_cli/runtime_provider.py`
+- `agent/anthropic_adapter.py`
+- `tests/hermes_cli/test_timeouts.py`
+
+关键行为：
+
 ```python
-def _normalize_base_url(base_url: str) -> str:
-    normalized = (base_url or "").strip().rstrip("/")
-    # Handle Gemini CLI's custom protocol format
-    if normalized.startswith("cloudcode-pa://"):
-        normalized = normalized.replace("cloudcode-pa://", "https://", 1)
-        if normalized == "https://google":
-            normalized = "https://cloudcode-pa.googleapis.com"
-    return normalized
+# Hermes config / health check 可保留 /coding/v1
+inference_base_url = "https://api.kimi.com/coding/v1"
+
+# 但 Anthropic SDK 调用前必须改为 /coding，避免 SDK 再追加 /v1/messages
+if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
+    normalized_base_url = "https://api.kimi.com/coding"
 ```
 
-**URL 映射**:
+验证点：
+
+- `kimi-coding` 使用 `https://api.kimi.com/coding/v1` 作为配置/模型列表端点。
+- `anthropic_messages` 路径传入 Anthropic SDK 前使用 `https://api.kimi.com/coding`。
+- stale `chat_completions` 不会覆盖 Kimi Coding 的 URL 检测结果。
+- `tests/hermes_cli/test_timeouts.py::test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk` 通过。
+
+---
+
+### 2. `02-gemini-cli-cloudcode-compat.patch`
+
+| 属性 | 值 |
+|------|-----|
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch` |
+| 优先级 | critical（继续使用 Gemini CLI 时） |
+| 修改类型 | Gemini CLI endpoint/OAuth/CloudCode stream 兼容 |
+| 上游冲突 | 上游可能使用 Hermes 自有 Google OAuth 格式，不兼容 Gemini CLI credential 文件 |
+| 保留理由 | 用户偏好交互式 OAuth/PKCE；需要 Hermes 与 Gemini CLI credential 互操作 |
+
+包含文件：
+
+- `agent/model_metadata.py`
+- `agent/gemini_cloudcode_adapter.py`
+- `agent/google_oauth.py`
+
+关键行为：
+
 ```python
-_URL_TO_PROVIDER: Dict[str, str] = {
-    # ... existing entries ...
-    "cloudcode-pa.googleapis.com": "gemini",
+# cloudcode-pa://google -> https://cloudcode-pa.googleapis.com
+if normalized.startswith("cloudcode-pa://"):
+    normalized = normalized.replace("cloudcode-pa://", "https://", 1)
+    if normalized == "https://google":
+        normalized = "https://cloudcode-pa.googleapis.com"
+```
+
+```python
+# 使用 Gemini CLI credential 路径
+Path.home() / ".gemini" / "oauth_creds.json"
+
+# 同时支持 Gemini CLI 格式与旧 Hermes 格式
+access_token = data.get("access_token") or data.get("access")
+refresh_token = data.get("refresh_token") or RefreshParts.parse(...).refresh_token
+expires_ms = data.get("expiry_date") or data.get("expires")
+```
+
+验证点：
+
+- `cloudcode-pa://google` 能被识别为 Gemini provider。
+- `~/.gemini/oauth_creds.json` 可被 Hermes 读取。
+- CloudCode stream delta 带 `content` 和 `tool_calls` 属性。
+
+---
+
+### 3. `03-provider-picker-dedup-and-local-policy.patch`
+
+| 属性 | 值 |
+|------|-----|
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/03-provider-picker-dedup-and-local-policy.patch` |
+| 优先级 | warning，但按用户要求保留 |
+| 修改类型 | Provider picker 去重、本机 provider 策略、测试适配 |
+| 上游冲突 | 上游可能恢复独立 `openai` provider 或移除 alias 去重逻辑 |
+| 保留理由 | 保持本机 Hermes picker 干净且只用 `openai-codex`，不显示普通 `openai` provider |
+
+包含文件：
+
+- `agent/models_dev.py`
+- `hermes_cli/model_switch.py` 中 provider alias 去重和重复显示名处理
+- `tests/hermes_cli/test_user_providers_model_switch.py`
+
+关键行为：
+
+```python
+PROVIDER_TO_MODELS_DEV = {
+    "openai-codex": "openai",
+    # 不恢复 "openai": "openai"
 }
 ```
 
+```python
+normalized_ep_name = normalize_provider(ep_name)
+if ep_name.lower() in seen_slugs or normalized_ep_name in seen_mdev_ids:
+    continue
+```
+
+验证点：
+
+- picker 中只出现 `openai-codex`，不出现独立 `openai`。
+- provider alias 不重复显示。
+- 重复 display name 会追加 slug 以便 Telegram/Web UI 区分。
+- `tests/hermes_cli/test_user_providers_model_switch.py` 通过。
+
 ---
 
-### 2. `agent/models_dev.py`
+### 4. `04-telegram-model-picker-cleanup.patch`
 
 | 属性 | 值 |
 |------|-----|
-| **修改类型** | 移除独立 `openai` provider，保留 `openai-codex` |
-| **上游冲突** | 🔴 上游恢复了 `"openai": "openai"` |
-| **保留理由** | 本地配置只使用 OAuth 认证的 `openai-codex`，不使用 API key 的 `openai` |
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch` |
+| 优先级 | normal |
+| 修改类型 | Telegram model picker 消息清理 |
+| 上游冲突 | 上游可能没有旧 picker 消息删除逻辑 |
+| 保留理由 | 防止重复发送 model picker 消息，避免 inline keyboard 堆积 |
 
-**Patch 内容**:
+包含文件：
+
+- `gateway/platforms/telegram.py`
+
+关键行为：
+
 ```python
-PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
-    "openrouter": "openrouter",
-    "anthropic": "anthropic",
-    # REMOVED: "openai": "openai",  # ← 删除此行
-    "openai-codex": "openai",       # ← 保留此行
-    "zai": "zai",
-    "kimi-coding": "kimi-for-coding",
-    # ...
-}
+old_state = self._model_picker_state.pop(str(chat_id), None)
+if old_state and old_state.get("msg_id"):
+    await self._bot.delete_message(chat_id=int(chat_id), message_id=old_state["msg_id"])
 ```
 
-**关联影响**:
-- `tests/hermes_cli/test_user_providers_model_switch.py` 需要适配（mock OAuth 认证状态）
+验证点：
+
+- Telegram 打开新的 model picker 前，会尝试删除同 chat 的旧 picker message。
+- 删除失败时静默忽略，不影响新 picker 发送。
 
 ---
 
-### 3. `hermes_cli/auth.py`
+## 旧 8 项文件级补丁映射
 
-| 属性 | 值 |
-|------|-----|
-| **修改类型** | Kimi provider 配置重写 + API key 解析增强 |
-| **上游冲突** | 🔴 上游恢复为 Moonshot 配置 |
-| **保留理由** | 使用 Kimi Coding Plan 端点，支持 `sk-kimi-*` 密钥 |
-
-**Patch 内容**:
-
-**ProviderConfig 修改**:
-```python
-"kimi-coding": ProviderConfig(
-    id="kimi-coding",
-    name="Kimi / Kimi Coding Plan",  # ← 从 "Kimi / Moonshot" 改名
-    auth_type="api_key",
-    # 使用 Kimi Coding Plan 端点
-    inference_base_url="https://api.kimi.com/coding/v1",  # ← 从 api.moonshot.ai/v1 迁移
-    api_key_env_vars=("KIMI_API_KEY", "KIMI_CODING_API_KEY"),
-    base_url_env_var="KIMI_BASE_URL",
-),
-```
-
-**KIMI_CODE_BASE_URL 修改**:
-```python
-# 使用 Coding/v1 端点（Anthropic Messages 兼容）
-KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
-```
-
-**API key 解析增强**:
-```python
-# 优先使用环境变量，回退到 ~/.hermes/.env
-val = os.getenv(env_var, "").strip()
-if not val:
-    try:
-        from hermes_cli.config import get_env_value
-        val = (get_env_value(env_var) or "").strip()
-    except Exception:
-        val = ""
-```
+| 旧文件级补丁 | 新功能级 patch |
+|--------------|----------------|
+| `by-file/agent_model_metadata.py.patch` | `02-gemini-cli-cloudcode-compat.patch` |
+| `gemini-all-fixes.patch` | `02-gemini-cli-cloudcode-compat.patch` |
+| `by-file/hermes_cli_auth.py.patch` | `01-kimi-coding-plan-runtime.patch` |
+| `by-file/hermes_cli_runtime_provider.py.patch` | `01-kimi-coding-plan-runtime.patch` |
+| `by-file/agent_anthropic_adapter.py.patch` | `01-kimi-coding-plan-runtime.patch` |
+| `by-file/tests_hermes_cli_test_timeouts_kimi_anthropic_base_url.patch` | `01-kimi-coding-plan-runtime.patch` |
+| `by-file/agent_models_dev.py.patch` | `03-provider-picker-dedup-and-local-policy.patch` |
+| `by-file/hermes_cli_model_switch.py.patch` | 拆分到 `01` 和 `03` |
+| `by-file/tests_hermes_cli_test_user_providers_model_switch_test-fix.patch` | `03-provider-picker-dedup-and-local-policy.patch` |
+| `by-file/gateway_platforms_telegram.py.patch` | `04-telegram-model-picker-cleanup.patch` |
 
 ---
 
-### 4. `hermes_cli/model_switch.py`
-
-| 属性 | 值 |
-|------|-----|
-| **修改类型** | Provider 别名去重 + Kimi 端点处理 + 重复名称显示优化 |
-| **上游冲突** | 🔴 上游移除了这些修改 |
-| **保留理由** | 防止 model picker 重复；Kimi 使用 Anthropic Messages 协议 |
-
-**Patch 内容**:
-
-**导入 `normalize_provider`**:
-```python
-from hermes_cli.providers import (
-    # ... existing imports ...
-    normalize_provider,  # ← 新增
-    resolve_provider_full,
-)
-```
-
-**Kimi 端点 /v1 剥离**:
-```python
-if (
-    api_mode == "anthropic_messages"
-    and target_provider in {"opencode-zen", "opencode-go", "kimi-coding"}  # ← 添加 "kimi-coding"
-    and isinstance(base_url, str)
-    and base_url
-):
-    base_url = re.sub(r"/v1/?$", "", base_url)
-```
-
-**Provider 去重（Section 3）**:
-```python
-for ep_name, ep_cfg in user_providers.items():
-    if not isinstance(ep_cfg, dict):
-        continue
-    normalized_ep_name = normalize_provider(ep_name)  # ← 新增
-    # Skip if this slug (or one of its aliases) was already emitted
-    if ep_name.lower() in seen_slugs or normalized_ep_name in seen_mdev_ids:  # ← 新增条件
-        continue
-    # ...
-    seen_mdev_ids.add(normalized_ep_name)  # ← 新增
-```
-
-**重复显示名称处理**:
-```python
-# Make duplicate display names explicit so messaging clients can distinguish
-name_counts: dict[str, int] = {}
-for row in results:
-    name = str(row.get("name", "")).strip()
-    if name:
-        name_counts[name] = name_counts.get(name, 0) + 1
-
-if any(count > 1 for count in name_counts.values()):
-    for row in results:
-        name = str(row.get("name", "")).strip()
-        slug = str(row.get("slug", "")).strip()
-        if name and slug and name_counts.get(name, 0) > 1 and slug != name:
-            row["name"] = f"{name} ({slug})"
-```
-
----
-
-### 5. `hermes_cli/runtime_provider.py`
-
-| 属性 | 值 |
-|------|-----|
-| **修改类型** | Kimi Coding api_mode 自动检测 + 端点处理 |
-| **上游冲突** | 🔴 上游移除了这些修改 |
-| **保留理由** | Kimi Coding 必须使用 Anthropic Messages，不能 fallback 到 chat_completions |
-
-**Patch 内容**:
-
-**`_resolve_runtime_from_pool_entry` 中的 api_mode 解析**:
-```python
-detected = _detect_api_mode_for_url(base_url)
-if provider == "kimi-coding" and detected:
-    # Kimi Coding's /coding endpoint only works through Anthropic Messages;
-    # ignore stale chat_completions persisted by older switch flows.
-    api_mode = detected
-elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-    api_mode = configured_mode
-elif provider in ("opencode-zen", "opencode-go"):
-    # ... existing opencode logic ...
-    from hermes_cli.models import opencode_model_api_mode
-    api_mode = opencode_model_api_mode(provider, effective_model)
-elif detected:
-    api_mode = detected
-```
-
-**`resolve_runtime_provider` 中的 Kimi 特殊处理**:
-```python
-if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go", "kimi-coding"):
-    # Kimi Coding's /coding/v1 endpoint must use Anthropic Messages.
-    # Do URL detection before honoring a persisted api_mode so stale
-    # chat_completions values written by older model-switch flows cannot
-    # break Kimi after an upgrade.
-    detected = _detect_api_mode_for_url(base_url)
-    if provider == "kimi-coding" and detected:
-        api_mode = detected
-    elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-        api_mode = configured_mode
-    elif provider in ("opencode-zen", "opencode-go"):
-        from hermes_cli.models import opencode_model_api_mode
-        api_mode = opencode_model_api_mode(provider, effective_model)
-    elif detected:
-        api_mode = detected
-```
-
----
-
-### 6. `gateway/platforms/telegram.py`
-
-| 属性 | 值 |
-|------|-----|
-| **修改类型** | Model picker 消息防累积 |
-| **上游冲突** | 🔴 上游删除了此逻辑 |
-| **保留理由** | 防止重复发送 model picker 消息，避免 inline keyboard 累积 |
-
-**Patch 内容**:
-```python
-try:
-    # If there's an existing picker message for this chat, delete it first
-    # so we don't accumulate stale inline-keyboard messages.
-    old_state = self._model_picker_state.pop(str(chat_id), None)
-    if old_state and old_state.get("msg_id"):
-        try:
-            await self._bot.delete_message(
-                chat_id=int(chat_id),
-                message_id=old_state["msg_id"],
-            )
-        except Exception:
-            pass  # Message may already be deleted or too old
-
-    # Build provider buttons — 2 per row
-    buttons: list = []
-    for p in providers:
-        # ... existing logic ...
-```
-
----
-
-### 7. `gemini-all-fixes.patch` (外部补丁文件)
-
-| 属性 | 值 |
-|------|-----|
-| **文件位置** | `/root/.hermes/hermes-agent-patches/gemini-all-fixes.patch` |
-| **修改类型** | Gemini CLI OAuth 格式兼容 + 流式响应属性修复 |
-| **上游冲突** | 🔴 上游使用不同的 OAuth 凭证格式 |
-| **保留理由** | 使 Hermes 的 Google OAuth 与 Gemini CLI 的 `~/.gemini/oauth_creds.json` 格式互操作；修复流式响应中 `SimpleNamespace` 缺少 `content` 属性导致的报错 |
-
-**Patch 内容**:
-
-**A. `agent/gemini_cloudcode_adapter.py` — 流式响应修复**:
-```python
-# 修复 _make_stream_chunk 中 delta 对象缺少 content/tool_calls 属性
-delta_kwargs: Dict[str, Any] = {
-    "role": "assistant",
-    "content": content if content else None,
-    "tool_calls": None,
-}
-if tool_call_delta is not None:
-    delta_kwargs["tool_calls"] = [SimpleNamespace(...)]
-```
-
-**B. `agent/google_oauth.py` — OAuth 凭证路径与格式兼容**:
-```python
-def _credentials_path() -> Path:
-    # 使用 Gemini CLI 的凭证路径，实现互操作
-    return Path.home() / ".gemini" / "oauth_creds.json"
-
-class GoogleCredentials:
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "access_token": self.access_token,
-            "refresh_token": self.refresh_token,
-            "expiry_date": int(self.expires_ms),
-            "token_type": "Bearer",
-            "scope": "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cloud-platform openid",
-            "refresh": RefreshParts(...).format(),
-            "email": self.email,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "GoogleCredentials":
-        # 同时支持 Gemini CLI 格式 (access_token/refresh_token/expiry_date)
-        # 和 Hermes 旧格式 (access/expires)
-        refresh_packed = str(data.get("refresh", "") or "")
-        parts = RefreshParts.parse(refresh_packed)
-        return cls(
-            access_token=str(data.get("access_token", "") or data.get("access", "") or ""),
-            refresh_token=str(data.get("refresh_token", "") or parts.refresh_token or ""),
-            expires_ms=int(data.get("expiry_date", 0) or data.get("expires", 0) or 0),
-            email=str(data.get("email", "") or ""),
-            project_id=parts.project_id,
-            managed_project_id=parts.managed_project_id,
-        )
-```
-
----
-
-## 测试适配
-
-### 需要修改的测试文件
-
-| 文件 | 修改原因 |
-|------|---------|
-| `tests/hermes_cli/test_user_providers_model_switch.py` | `openai` provider 改为 `openai-codex` (OAuth) |
-
-### 测试修改示例
-
-```python
-# BEFORE (上游期望)
-def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    providers = list_authenticated_providers()
-    openai = next(p for p in providers if p.slug == "openai")
-    assert openai.total_models > 0
-    assert openai.source == "built-in"
-
-# AFTER (适配 openai-codex OAuth)
-def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch):
-    from hermes_cli.providers import HermesOverlay, HERMES_OVERLAYS
-    import agent.credential_pool
-    
-    monkeypatch.setitem(
-        HERMES_OVERLAYS, "openai-codex",
-        HermesOverlay(auth_type="oauth_external")
-    )
-    monkeypatch.setattr(
-        agent.credential_pool, "load_pool",
-        lambda: type("Pool", (), {"has_credentials": lambda self: True})()
-    )
-    providers = list_authenticated_providers()
-    openai_codex = next(p for p in providers if p.slug == "openai-codex")
-    assert openai_codex.total_models > 0
-    assert openai_codex.source == "hermes"
-```
-
----
-
-## 上游 Sync 后恢复流程
-
-### 与 `hermes-safe-update-with-local-patches` Skill 的协作
-
-**Skill 负责**：安全地同步上游、创建备份、处理合并冲突  
-**本文档负责**：在 skill 完成后，指导如何重新应用本地 patch
-
-**执行顺序**：
-1. 先执行 `hermes-safe-update-with-local-patches` skill 完成上游同步
-2. 然后参考本文档的 "Patch 内容" 部分手动恢复各文件
-3. 最后修复测试并提交
+## 上游 sync 后恢复流程
 
 ### 自动恢复脚本
 
+脚本位置：
+
 ```bash
-#!/bin/bash
-# restore-local-patches.sh
-# 在上游 sync 后执行（skill 完成后）
+/root/.hermes/hermes-agent-patches/restore-local-patches.sh
+```
 
-PATCH_DIR="/root/.hermes/hermes-agent-patches/by-file"
-cd ~/.hermes/hermes-agent
+执行方式：
 
-echo "=== 恢复本地 Patch ==="
+```bash
+cd /root/.hermes/hermes-agent
+/root/.hermes/hermes-agent-patches/restore-local-patches.sh
+```
 
-# 1. 检查是否有冲突标记
-if grep -r "<<<<<<< HEAD" agent/ hermes_cli/ gateway/ 2>/dev/null; then
-    echo "ERROR: 存在未解决的冲突标记"
-    exit 1
-fi
+脚本会按顺序应用：
 
-# 2. 应用各文件的 patch（统一从 by-file 目录）
-git apply "$PATCH_DIR/agent_model_metadata.py.patch"          # Gemini CLI
-git apply "$PATCH_DIR/agent_models_dev.py.patch"             # 移除 openai
-git apply "$PATCH_DIR/hermes_cli_auth.py.patch"              # Kimi Coding Plan
-git apply "$PATCH_DIR/hermes_cli_model_switch.py.patch"      # 去重 + Kimi
-git apply "$PATCH_DIR/hermes_cli_runtime_provider.py.patch"  # api_mode 检测
-git apply "$PATCH_DIR/gateway_platforms_telegram.py.patch"     # picker 清理
+1. `01-kimi-coding-plan-runtime.patch`
+2. `02-gemini-cli-cloudcode-compat.patch`
+3. `03-provider-picker-dedup-and-local-policy.patch`
+4. `04-telegram-model-picker-cleanup.patch`
 
-# 3. 应用 Gemini 统一修复补丁
-git apply /root/.hermes/hermes-agent-patches/gemini-all-fixes.patch
+然后执行：
 
-# 4. 修复测试
-git apply "$PATCH_DIR/tests_hermes_cli_test_user_providers_model_switch_test-fix.patch"
+```bash
+python3 -m py_compile \
+  agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
+  agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
+  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
+  gateway/platforms/telegram.py
 
-echo "=== 验证 ==="
-python -m pytest tests/hermes_cli/test_user_providers_model_switch.py tests/hermes_cli/test_models.py -q
-
-echo "=== 提交 ==="
-git add -A
-git commit -m "restore: re-apply high-value local patches after upstream sync ($(date +%Y-%m-%d))"
+PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+  tests/hermes_cli/test_user_providers_model_switch.py \
+  tests/hermes_cli/test_models.py \
+  tests/hermes_cli/test_timeouts.py -q
 ```
 
 ### 手动恢复步骤
 
-1. **执行 skill 完成上游同步**
-   - 运行 `hermes-safe-update-with-local-patches` skill
-   - 解决合并冲突（保留上游的兼容性修复）
-   - 确认 `main` 已对齐 `upstream/main`
+1. 先用 `hermes-safe-update-with-local-patches` 完成 upstream sync / merge / backup。
+2. 确认工作树无冲突标记。
+3. 应用 `/root/.hermes/hermes-agent-patches/by-feature/` 下 4 个 patch。
+4. 运行语法检查和 targeted tests。
+5. 检查 picker 行为：`kimi-coding` 保留，`openai-codex` 保留，普通 `openai` 不作为独立 provider 显示。
+6. Review diff 后再提交。
 
-2. **应用 patch**（参考本文档 "Patch 内容" 部分）
-   - 逐文件检查并应用修改
-   - 不要直接 cherry-pick 整个文件（可能覆盖上游修复）
-   - 优先使用 `git cherry-pick --no-commit <patch-commit>`
+---
 
-3. **修复测试**
-   - 运行 `pytest tests/hermes_cli/test_user_providers_model_switch.py`
-   - 根据失败信息更新测试期望（参考 "测试适配" 部分）
+## 当前验证命令
 
-4. **验证**
-   - `hermes model` 正确显示 provider 列表
-   - `kimi-coding` 和 `openai-codex` 正常显示
-   - 无重复 provider 条目
+```bash
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-provider-picker-dedup-and-local-policy.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch
 
-5. **提交**
-   ```bash
-   git add -A
-   git commit -m "restore: re-apply high-value local patches after upstream sync (YYYY-MM-DD)"
-   ```
+python3 -m py_compile \
+  agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
+  agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
+  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/runtime_provider.py \
+  gateway/platforms/telegram.py
+
+PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+  tests/hermes_cli/test_user_providers_model_switch.py \
+  tests/hermes_cli/test_models.py \
+  tests/hermes_cli/test_timeouts.py -q
+```
 
 ---
 
 ## 版本历史
 
-| 日期 | Commit | 说明 |
-|------|--------|------|
-| 2026-04-29 | `117a269` | 首次整理并文档化本地 patch |
-| 2026-04-29 | `74e6528` | 适配测试：openai → openai-codex OAuth |
-| 2026-04-30 | — | 新增 `gemini-all-fixes.patch` 为独立 Patch 条目（已在恢复脚本中引用，现补充文档说明） |
+| 日期 | 说明 |
+|------|------|
+| 2026-04-29 | 首次整理并文档化本地 patch |
+| 2026-04-30 | 新增 `gemini-all-fixes.patch` 为正式恢复项 |
+| 2026-04-30 | 新增 Kimi Coding Anthropic SDK URL 归一化，修复 title generation 404 |
+| 2026-04-30 | 从 8 个文件级 patch 精简为 4 个功能级 patch；保留 Kimi/Gemini 核心修复和 openai-codex-only picker 策略 |
 
 ---
 
 ## 长期建议
 
-1. **考虑上游化**: 以下 patch 可以考虑提交 PR 到 NousResearch：
-   - Provider 别名去重 (`normalize_provider`)
-   - Telegram picker 消息清理
-   - 重复显示名称处理
-
-2. **保持文档更新**: 每次 sync 后更新此文档，记录新的冲突模式
-
-3. **自动化**: 考虑使用 `git notes` 或 `git config` 存储 patch 元数据
+1. 尽量上游化 provider alias 去重、重复 display name 处理、Telegram picker cleanup。
+2. Kimi Coding 双端点逻辑需要独立回归测试长期保留。
+3. 每次 upstream sync 后优先检查 `01-kimi-coding-plan-runtime.patch`，因为它直接影响 auxiliary/title generation 是否 404。
+4. 不要重新引入独立 `openai` provider，除非用户明确改变本机策略。

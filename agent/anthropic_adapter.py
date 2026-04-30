@@ -422,6 +422,16 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
     from httpx import Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
+    if normalized_base_url:
+        # Kimi exposes two different Coding surfaces:
+        #   https://api.kimi.com/coding     -> Anthropic Messages API
+        #   https://api.kimi.com/coding/v1  -> OpenAI-compatible API
+        # Hermes may store /coding/v1 because that endpoint supports /models
+        # health checks, but the Anthropic SDK appends /v1/messages itself.
+        # Passing /coding/v1 to the SDK therefore produces
+        # /coding/v1/v1/messages and Kimi returns HTTP 404.
+        if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
+            normalized_base_url = "https://api.kimi.com/coding"
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     kwargs = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),

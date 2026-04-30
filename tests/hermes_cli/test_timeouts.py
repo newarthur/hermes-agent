@@ -149,6 +149,26 @@ def test_anthropic_adapter_honors_timeout_kwarg():
     assert c_custom.timeout.connect == 10.0
 
 
+def test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk():
+    """Kimi /coding/v1 is OpenAI-compatible; Anthropic SDK must use /coding.
+
+    The Anthropic SDK appends /v1/messages internally.  If Hermes passes
+    https://api.kimi.com/coding/v1 as the SDK base_url, requests go to
+    /coding/v1/v1/messages and Kimi returns HTTP 404.
+    """
+    pytest = __import__("pytest")
+    pytest.importorskip("anthropic")
+    from agent.anthropic_adapter import build_anthropic_client
+
+    client = build_anthropic_client(
+        "sk-kimi-dummy",
+        "https://api.kimi.com/coding/v1",
+    )
+
+    assert str(client.base_url).rstrip("/") == "https://api.kimi.com/coding"
+    assert client.default_headers.get("User-Agent") == "claude-code/0.1.0"
+
+
 def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     """AIAgent._resolved_api_call_timeout() honors config > env > default priority."""
     # Isolate HERMES_HOME
