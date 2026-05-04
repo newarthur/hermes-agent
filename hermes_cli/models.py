@@ -1741,10 +1741,20 @@ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
 
 
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
-    """Return True if the model is a Claude model eligible for Anthropic Fast Mode."""
+    """Return True if the model is a Claude model eligible for Anthropic Fast Mode.
+
+    Fast mode is currently supported on Claude Opus 4.6 only. Per Anthropic's
+    docs (https://platform.claude.com/docs/en/build-with-claude/fast-mode):
+    "Fast mode is currently supported on Opus 4.6 only. Sending speed: fast
+    with an unsupported model returns an error." Opus 4.7 explicitly rejects
+    the ``speed`` parameter with HTTP 400.
+    """
     raw = _strip_vendor_prefix(str(model_id or ""))
     base = raw.split(":")[0]
-    return base.startswith("claude-")
+    if not base.startswith("claude-"):
+        return False
+    # Only Opus 4.6 supports fast mode at present.
+    return "opus-4-6" in base or "opus-4.6" in base
 
 
 def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | None:
@@ -3088,7 +3098,7 @@ def validate_requested_model(
             "message": f"Model `{requested}` was not found in LM Studio's model listing.",
         }
 
-    if normalized == "custom":
+    if normalized == "custom" or normalized.startswith("custom:"):
         # Try probing with correct auth for the api_mode.
         if api_mode == "anthropic_messages":
             probe = probe_api_models(api_key, base_url, api_mode=api_mode)
@@ -3186,11 +3196,12 @@ def validate_requested_model(
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
             return {
-                "accepted": False,
-                "persist": False,
+                "accepted": True,
+                "persist": True,
                 "recognized": False,
                 "message": (
-                    f"Model `{requested}` was not found in the OpenAI Codex model listing."
+                    f"Note: `{requested}` was not found in the OpenAI Codex model listing. "
+                    "It may still work if your ChatGPT/Codex account has access to a newer or hidden model ID."
                     f"{suggestion_text}"
                 ),
             }
