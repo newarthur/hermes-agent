@@ -298,6 +298,7 @@ def load_cli_config() -> Dict[str, Any]:
         "browser": {
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
             "record_sessions": False,  # Auto-record browser sessions as WebM videos
+            "engine": "auto",  # Browser engine: auto (Chrome), lightpanda, chrome
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
@@ -939,6 +940,18 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                     logger.info("Pruned %d empty TUI ghost sessions", pruned)
         except Exception as _prune_exc:
             logger.debug("Ghost session prune skipped: %s", _prune_exc)
+
+        # One-time finalize of orphaned compression continuations (#20001).
+        try:
+            if not session_db.get_meta("orphaned_compression_finalize_v1"):
+                finalized = session_db.finalize_orphaned_compression_sessions()
+                session_db.set_meta("orphaned_compression_finalize_v1", "1")
+                if finalized:
+                    logger.info(
+                        "Finalized %d orphaned compression sessions", finalized
+                    )
+        except Exception as _finalize_exc:
+            logger.debug("Orphan compression finalize skipped: %s", _finalize_exc)
 
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_prune", False):
@@ -7193,7 +7206,20 @@ class HermesCLI:
                 if provider is not None:
                     print(f"🌐 Browser: {provider.provider_name()} (cloud)")
                 else:
-                    print("🌐 Browser: local headless Chromium (agent-browser)")
+                    # Show engine info for local mode
+                    try:
+                        from tools.browser_tool import _get_browser_engine
+                        engine = _get_browser_engine()
+                    except Exception:
+                        engine = "auto"
+                    if engine == "lightpanda":
+                        print("🌐 Browser: local Lightpanda (agent-browser --engine lightpanda)")
+                        print("   ⚡ Lightpanda: faster navigation, no screenshot support")
+                        print("   Automatic Chrome fallback for screenshots and failed commands")
+                    elif engine == "chrome":
+                        print("🌐 Browser: local headless Chrome (agent-browser --engine chrome)")
+                    else:
+                        print("🌐 Browser: local headless Chromium (agent-browser)")
             print()
             print("   /browser connect      — connect to your live Chrome")
             print("   /browser disconnect   — revert to default")
