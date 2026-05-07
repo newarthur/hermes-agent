@@ -1,12 +1,12 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-04-30
+> 最后更新: 2026-05-07
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
 
-本仓库在 NousResearch/hermes-agent 上游基础上维护 4 个功能级本地 patch。目标是让每次 upstream sync 后恢复动作更少、更不容易漏掉跨文件依赖。
+本仓库在 NousResearch/hermes-agent 上游基础上维护 5 个功能级本地 patch。目标是让每次 upstream sync 后恢复动作更少、更不容易漏掉跨文件依赖。
 
 核心保留策略：
 
@@ -14,6 +14,7 @@
 2. 保留 Gemini CLI / CloudCode 兼容修复，包括 `cloudcode-pa://`、Gemini CLI OAuth credential 格式、stream chunk delta 属性，以及 Code Assist tool-use/functionResponse 历史组织。
 3. 保留 persona model routes：CLI/Gateway 切换 personality 时同步切换 provider/model/fallback，并兼容 `agent.persona_model_routes` 与历史顶层 `persona_model_routes`。
 4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
+5. 保留 Kimi fallback 修复：fallback provider/base_url 指向 Kimi Coding 时必须走 `anthropic_messages`，并保留 run_agent API message rebuild 路径，避免上游重构覆盖本地兼容逻辑。
 
 补充：provider picker 去重、本机 `openai-codex` 策略已合并进 `01-kimi-coding-plan-runtime.patch`，不再单独维护 `03-provider-picker-dedup-and-local-policy.patch`。
 
@@ -25,16 +26,17 @@
 │   ├── 01-kimi-coding-plan-runtime.patch
 │   ├── 02-gemini-cli-cloudcode-compat.patch
 │   ├── 03-persona-model-routing.patch
-│   └── 04-telegram-model-picker-cleanup.patch
+│   ├── 04-telegram-model-picker-cleanup.patch
+│   └── 05-kimi-fallback-fix.patch
 ├── by-file/                         # 历史参考；不再作为主恢复入口
-└── restore-local-patches.sh          # 当前恢复脚本，应用 4 个功能 patch
+└── restore-local-patches.sh          # 当前恢复脚本，应用 5 个功能 patch
 ```
 
 重要：以后恢复以 `by-feature/` 为准。`by-file/` 仅保留作历史 diff/debug 参考，不要再把它当主清单。
 
 ---
 
-## Patch 文件清单（4 个功能级 patch）
+## Patch 文件清单（5 个功能级 patch）
 
 ### 1. `01-kimi-coding-plan-runtime.patch`
 
@@ -195,6 +197,40 @@ if old_state and old_state.get("msg_id"):
 
 ---
 
+### 5. `05-kimi-fallback-fix.patch`
+
+| 属性 | 值 |
+|------|-----|
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/05-kimi-fallback-fix.patch` |
+| 优先级 | critical（Kimi fallback 依赖） |
+| 修改类型 | fallback api_mode 推断、run_agent API message rebuild 兼容 |
+| 上游冲突 | 上游可能仅按 `anthropic` provider 或 `/anthropic` base_url 判断 fallback，不识别 `kimi-coding` / `/coding`；上游重构 run_agent message rebuild 时可能覆盖本地 sanitization 顺序 |
+| 保留理由 | 避免 fallback 到 Kimi Coding 时错误走 `chat_completions`，并确保 API-call-time message rebuild 继续保留 Hermes 本地的 reasoning/tool-call sanitization 兼容路径 |
+
+包含文件：
+
+- `run_agent.py`
+
+关键行为：
+
+```python
+elif (
+    fb_provider == "anthropic"
+    or fb_provider == "kimi-coding"
+    or fb_base_url.rstrip("/").lower().endswith("/anthropic")
+    or "/coding" in fb_base_url.lower()
+):
+    fb_api_mode = "anthropic_messages"
+```
+
+验证点：
+
+- fallback provider 为 `kimi-coding` 时 api_mode 是 `anthropic_messages`。
+- fallback base_url 包含 `/coding` 时 api_mode 是 `anthropic_messages`。
+- `git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/05-kimi-fallback-fix.patch` 通过。
+
+---
+
 ## 旧 8 项文件级补丁映射
 
 | 旧文件级补丁 | 新功能级 patch |
@@ -235,6 +271,7 @@ cd /root/.hermes/hermes-agent
 2. `02-gemini-cli-cloudcode-compat.patch`
 3. `03-persona-model-routing.patch`
 4. `04-telegram-model-picker-cleanup.patch`
+5. `05-kimi-fallback-fix.patch`
 
 然后执行：
 
@@ -245,7 +282,8 @@ python3 -m py_compile \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
   hermes_cli/runtime_provider.py \
-  gateway/platforms/telegram.py
+  gateway/platforms/telegram.py \
+  run_agent.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
@@ -259,7 +297,7 @@ PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
 
 1. 先用 `hermes-safe-update-with-local-patches` 完成 upstream sync / merge / backup。
 2. 确认工作树无冲突标记。
-3. 应用 `/root/.hermes/hermes-agent-patches/by-feature/` 下 4 个 patch。
+3. 应用 `/root/.hermes/hermes-agent-patches/by-feature/` 下 5 个 patch。
 4. 运行语法检查和 targeted tests。
 5. 检查 picker 行为：`kimi-coding` 保留，`openai-codex` 保留，普通 `openai` 不作为独立 provider 显示。
 6. Review diff 后再提交。
@@ -273,6 +311,7 @@ git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/01-kim
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-persona-model-routing.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/05-kimi-fallback-fix.patch
 
 python3 -m py_compile \
   cli.py gateway/run.py \
@@ -280,7 +319,8 @@ python3 -m py_compile \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
   hermes_cli/runtime_provider.py \
-  gateway/platforms/telegram.py
+  gateway/platforms/telegram.py \
+  run_agent.py
 
 PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
@@ -301,6 +341,7 @@ PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
 | 2026-04-30 | 新增 Kimi Coding Anthropic SDK URL 归一化，修复 title generation 404 |
 | 2026-04-30 | 从 8 个文件级 patch 精简为 4 个功能级 patch；保留 Kimi/Gemini 核心修复和 openai-codex-only picker 策略 |
 | 2026-04-30 | 将 `05-kimi-reasoning-content-padding.patch` 合并进 `01-kimi-coding-plan-runtime.patch`，将 Gemini Code Assist tool-use 补丁合并进 `02-gemini-cli-cloudcode-compat.patch` |
+| 2026-05-07 | 将 `05-kimi-fallback-fix.patch` 补入正式 patch 清单，和 `restore-local-patches.sh` 保持一致 |
 
 ---
 
