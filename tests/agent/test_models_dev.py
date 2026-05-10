@@ -90,7 +90,9 @@ class TestProviderMapping:
         assert "nous" not in PROVIDER_TO_MODELS_DEV
 
     def test_openai_codex_mapped_to_openai(self):
-        assert PROVIDER_TO_MODELS_DEV["openai"] == "openai"
+        # Local Hermes policy exposes OpenAI models through openai-codex only;
+        # the standalone openai provider row is intentionally hidden.
+        assert "openai" not in PROVIDER_TO_MODELS_DEV
         assert PROVIDER_TO_MODELS_DEV["openai-codex"] == "openai"
 
 
