@@ -517,6 +517,42 @@ class TestExtractReasoning:
         msg = _mock_assistant_msg(content=content)
         assert agent._extract_reasoning(msg) == expected
 
+    def test_content_list_thinking_blocks_extracted(self, agent):
+        """DeepSeek V4 Pro returns content as a typed-block list (issue #21944).
+
+        Without this branch thinking text is silently dropped → HTTP 400 on
+        the next turn ("thinking must be passed back to the API").
+        """
+        msg = _mock_assistant_msg(
+            content=[
+                {"type": "thinking", "thinking": "deep analysis here"},
+                {"type": "output", "text": "final answer"},
+            ]
+        )
+        result = agent._extract_reasoning(msg)
+        assert result == "deep analysis here"
+
+    def test_content_list_non_thinking_blocks_ignored(self, agent):
+        """Non-thinking blocks in a content list must not be treated as reasoning."""
+        msg = _mock_assistant_msg(
+            content=[
+                {"type": "text", "text": "just a regular response"},
+            ]
+        )
+        assert agent._extract_reasoning(msg) is None
+
+    def test_content_list_thinking_prefers_structured_field(self, agent):
+        """Structured ``reasoning`` field wins over content-list thinking blocks."""
+        msg = _mock_assistant_msg(
+            reasoning="from structured field",
+            content=[
+                {"type": "thinking", "thinking": "from content list"},
+            ],
+        )
+        result = agent._extract_reasoning(msg)
+        # structured field was found first → content-list branch skipped
+        assert result == "from structured field"
+
 
 class TestCleanSessionContent:
     def test_none_passthrough(self):
@@ -3729,8 +3765,8 @@ class TestMaxTokensParam:
         assert result == {"max_completion_tokens": 4096}
 
 
-class TestAzureOpenAIRouting:
-    """Verify Azure OpenAI endpoints stay on chat_completions for gpt-5.x."""
+class TestGpt5ApiModeRouting:
+    """Verify provider-specific GPT-5 API-mode routing."""
 
     def test_azure_gpt5_stays_on_chat_completions(self, agent):
         """Azure serves gpt-5.x on /chat/completions — must not upgrade to codex_responses."""
@@ -3768,6 +3804,25 @@ class TestAzureOpenAIRouting:
         ):
             agent.api_mode = "codex_responses"
         assert agent.api_mode == "codex_responses"
+
+    def test_nous_gpt5_stays_on_chat_completions(self, agent):
+        """Nous serves gpt-5.x on /chat/completions — must not upgrade to codex_responses."""
+        agent.provider = "nous"
+        agent.base_url = "https://inference-api.nousresearch.com/v1"
+        agent.api_mode = "chat_completions"
+        agent.model = "openai/gpt-5.5"
+        if (
+            agent.api_mode == "chat_completions"
+            and not agent._is_azure_openai_url()
+            and (
+                agent._is_direct_openai_url()
+                or agent._provider_model_requires_responses_api(
+                    agent.model, provider=agent.provider,
+                )
+            )
+        ):
+            agent.api_mode = "codex_responses"
+        assert agent.api_mode == "chat_completions"
 
     def test_is_azure_openai_url_detection(self, agent):
         assert agent._is_azure_openai_url("https://foo.openai.azure.com/openai/v1") is True
