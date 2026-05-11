@@ -321,7 +321,15 @@ class PlatformConfig:
 class StreamingConfig:
     """Configuration for real-time token streaming to messaging platforms."""
     enabled: bool = False
-    transport: str = "edit"       # "edit" (progressive editMessageText) or "off"
+    # Transport selection:
+    #   "auto"  — prefer native streaming-draft updates when the platform
+    #             supports them (Telegram sendMessageDraft, Bot API 9.5+);
+    #             fall back to edit-based when not.  Recommended.
+    #   "draft" — explicitly request native drafts; falls back to edit when
+    #             the platform/chat doesn't support them.
+    #   "edit"  — progressive editMessageText only (legacy behaviour).
+    #   "off"   — disable streaming entirely.
+    transport: str = "auto"
     edit_interval: float = 1.0    # Seconds between message edits (Telegram rate-limits at ~1/s)
     buffer_threshold: int = 40    # Chars before forcing an edit
     cursor: str = " ▉"           # Cursor shown during streaming
@@ -350,7 +358,7 @@ class StreamingConfig:
             return cls()
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
-            transport=data.get("transport", "edit"),
+            transport=data.get("transport", "auto"),
             edit_interval=_coerce_float(data.get("edit_interval"), 1.0),
             buffer_threshold=_coerce_int(data.get("buffer_threshold"), 40),
             cursor=data.get("cursor", " ▉"),
@@ -766,10 +774,18 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:
                     bridged["allow_from"] = platform_cfg["allow_from"]
+                if "allow_admin_from" in platform_cfg:
+                    bridged["allow_admin_from"] = platform_cfg["allow_admin_from"]
+                if "user_allowed_commands" in platform_cfg:
+                    bridged["user_allowed_commands"] = platform_cfg["user_allowed_commands"]
                 if "group_policy" in platform_cfg:
                     bridged["group_policy"] = platform_cfg["group_policy"]
                 if "group_allow_from" in platform_cfg:
                     bridged["group_allow_from"] = platform_cfg["group_allow_from"]
+                if "group_allow_admin_from" in platform_cfg:
+                    bridged["group_allow_admin_from"] = platform_cfg["group_allow_admin_from"]
+                if "group_user_allowed_commands" in platform_cfg:
+                    bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in (Platform.DISCORD, Platform.SLACK) and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:

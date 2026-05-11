@@ -283,6 +283,11 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
 
+    @property
+    def message_len_fn(self):
+        """Telegram measures message length in UTF-16 code units."""
+        return utf16_len
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
@@ -864,6 +869,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, name, chat_id, e,
                 )
             return None
+
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a forum topic for a session handoff.
+
+        Works for DM topics (Bot API 9.4+, requires user to enable Topics
+        in their chat with the bot) and forum supergroups. Returns the
+        ``message_thread_id`` as a string, or ``None`` on failure.
+        """
+        try:
+            chat_id_int = int(parent_chat_id)
+        except (TypeError, ValueError):
+            return None
+        thread_id = await self._create_dm_topic(chat_id_int, name=name)
+        return str(thread_id) if thread_id else None
 
     async def rename_dm_topic(
         self,
@@ -1663,6 +1686,109 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return False
 
+    def supports_draft_streaming(
+        self,
+        chat_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Telegram supports sendMessageDraft for private chats only.
+
+        Bot API 9.5 (March 2026) opened ``sendMessageDraft`` to all bots
+        unconditionally for private (DM) chats.  Groups, supergroups, and
+        channels still rely on the edit-based path.
+
+        We additionally require ``self._bot`` to expose ``send_message_draft``
+        (added to python-telegram-bot in 22.6); older PTB installs gracefully
+        fall back to the edit path even on DMs.
+        """
+        if not self._bot or not hasattr(self._bot, "send_message_draft"):
+            return False
+        return (chat_type or "").lower() in ("dm", "private")
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Stream a partial message via Telegram's native sendMessageDraft.
+
+        The Bot API animates the preview when the same ``draft_id`` is reused
+        across consecutive calls in the same chat.  When the response
+        finishes, the caller sends the final text via the normal ``send``
+        path; the draft preview clears naturally on the client (Telegram has
+        no Bot API to "promote" a draft to a real message — the final
+        ``sendMessage`` is what the user receives in their history).
+        """
+        if not self._bot:
+            return SendResult(success=False, error="not_connected")
+        if not hasattr(self._bot, "send_message_draft"):
+            return SendResult(success=False, error="api_unavailable")
+
+        # Trim to the same UTF-16 budget the platform enforces on regular
+        # sends.  Drafts have the same length contract as messages.
+        text = content if len(content) <= self.MAX_MESSAGE_LENGTH else \
+            self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "draft_id": int(draft_id),
+            "text": text,
+        }
+        thread_id = self._metadata_thread_id(metadata)
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+
+        try:
+            ok = await self._bot.send_message_draft(**kwargs)
+            if ok:
+                # Drafts have no message_id; we report success without one
+                # so the caller knows the animation frame landed.
+                return SendResult(success=True, message_id=None)
+            return SendResult(success=False, error="draft_rejected")
+        except Exception as e:
+            # Most likely: BadRequest because this bot/chat doesn't allow
+            # drafts, or a transient server hiccup.  The caller treats any
+            # failure as "fall back to edit-based for this response".
+            logger.debug(
+                "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
+                self.name, chat_id, draft_id, e,
+            )
+            return SendResult(success=False, error=str(e))
+
+    async def _send_message_with_thread_fallback(self, **kwargs):
+        """Send a Telegram message, retrying once without message_thread_id
+        if Telegram returns 'Message thread not found'.
+
+        Used for control-style sends (approval prompts, model picker,
+        update prompts) that can carry a stale thread_id from a DM
+        reply chain.  The streaming send loop has its own equivalent
+        (PR #3390) at the body of ``send``; this helper applies the
+        same retry pattern to the non-streaming control paths.
+        """
+        if not self._bot:
+            raise RuntimeError("Not connected")
+
+        message_thread_id = kwargs.get("message_thread_id")
+        try:
+            return await self._bot.send_message(**kwargs)
+        except Exception as send_err:
+            if (
+                message_thread_id is not None
+                and self._is_bad_request_error(send_err)
+                and self._is_thread_not_found_error(send_err)
+            ):
+                logger.warning(
+                    "[%s] Thread %s not found for control message, retrying without message_thread_id",
+                    self.name,
+                    message_thread_id,
+                )
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("message_thread_id", None)
+                return await self._bot.send_message(**retry_kwargs)
+            raise
+
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
@@ -1686,7 +1812,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ])
             thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
-            msg = await self._bot.send_message(
+            msg = await self._send_message_with_thread_fallback(
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
@@ -1766,7 +1892,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            msg = await self._bot.send_message(**kwargs)
+            msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
             self._approval_state[approval_id] = session_key
@@ -1818,7 +1944,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            msg = await self._bot.send_message(**kwargs)
+            msg = await self._send_message_with_thread_fallback(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1888,7 +2014,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
-            msg = await self._bot.send_message(
+            msg = await self._send_message_with_thread_fallback(
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
@@ -4058,9 +4184,24 @@ class TelegramAdapter(BasePlatformAdapter):
         elif chat.type == ChatType.CHANNEL:
             chat_type = "channel"
 
-        # Resolve DM topic name and skill binding
+        # Resolve DM topic name and skill binding.
+        # In private chats, only preserve thread ids for real topic messages
+        # (is_topic_message=True).  Telegram puts message_thread_id on every
+        # DM that is a reply, even when the user is just replying to a
+        # previous message in the same DM — that bogus id then routes to a
+        # nonexistent thread and Telegram returns 'Message thread not found'
+        # on send (#3206).
         thread_id_raw = message.message_thread_id
-        thread_id_str = str(thread_id_raw) if thread_id_raw is not None else None
+        is_topic_message = bool(getattr(message, "is_topic_message", False))
+        thread_id_str = None
+        if thread_id_raw is not None:
+            if chat_type == "group":
+                thread_id_str = str(thread_id_raw)
+            elif chat_type == "dm" and is_topic_message:
+                thread_id_str = str(thread_id_raw)
+        # For forum groups without an explicit topic, default to the
+        # General-topic id so the gateway routes back to the General topic
+        # rather than dropping into the bot's main channel (#22423).
         if chat_type == "group" and thread_id_str is None and getattr(chat, "is_forum", False):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
