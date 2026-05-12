@@ -1,12 +1,12 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-05-07
+> 最后更新: 2026-05-12
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
 
-本仓库在 NousResearch/hermes-agent 上游基础上维护 5 个功能级本地 patch。目标是让每次 upstream sync 后恢复动作更少、更不容易漏掉跨文件依赖。
+本仓库在 NousResearch/hermes-agent 上游基础上维护 6 个功能级本地 patch。由于上游近期重构与本地功能存在重叠 hunks，当前恢复入口改为一个由 `git diff upstream/main..HEAD` 生成的 canonical overlay：`00-current-local-overlay.patch`。旧的功能级 patch 继续保留作审计/定位参考，但不再要求它们能在任意新版 upstream 上独立顺序应用。
 
 核心保留策略：
 
@@ -15,6 +15,7 @@
 3. 保留 persona model routes：CLI/Gateway 切换 personality 时同步切换 provider/model/fallback，并兼容 `agent.persona_model_routes` 与历史顶层 `persona_model_routes`。
 4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
 5. 保留 Kimi fallback 修复：fallback provider/base_url 指向 Kimi Coding 时必须走 `anthropic_messages`，并保留 run_agent API message rebuild 路径，避免上游重构覆盖本地兼容逻辑。
+6. 保留 Gemini CLI auxiliary compression 路由：`google-gemini-cli` 辅助压缩通过 CloudCode 客户端调用，避免走不兼容的 OpenAI/Anthropic 路径。
 
 补充：provider picker 去重、本机 `openai-codex` 策略已合并进 `01-kimi-coding-plan-runtime.patch`，不再单独维护 `03-provider-picker-dedup-and-local-policy.patch`。
 
@@ -23,20 +24,22 @@
 ```text
 /root/.hermes/hermes-agent-patches/
 ├── by-feature/
-│   ├── 01-kimi-coding-plan-runtime.patch
+│   ├── 00-current-local-overlay.patch     # 当前唯一恢复入口；由 upstream/main..HEAD 生成
+│   ├── 01-kimi-coding-plan-runtime.patch  # 历史/审计参考
 │   ├── 02-gemini-cli-cloudcode-compat.patch
 │   ├── 03-persona-model-routing.patch
 │   ├── 04-telegram-model-picker-cleanup.patch
-│   └── 05-kimi-fallback-fix.patch
-├── by-file/                         # 历史参考；不再作为主恢复入口
-└── restore-local-patches.sh          # 当前恢复脚本，应用 5 个功能 patch
+│   ├── 05-kimi-fallback-fix.patch
+│   └── 06-gemini-cli-auxiliary-compression.patch
+├── by-file/                               # 历史参考；不再作为主恢复入口
+└── restore-local-patches.sh                # 当前恢复脚本，应用 00 overlay 并执行验证
 ```
 
-重要：以后恢复以 `by-feature/` 为准。`by-file/` 仅保留作历史 diff/debug 参考，不要再把它当主清单。
+重要：以后恢复以 `by-feature/00-current-local-overlay.patch` 为准。其余 `by-feature/` 与 `by-file/` patch 仅保留作历史 diff/debug 参考，不要再把它们当主恢复清单。
 
 ---
 
-## Patch 文件清单（5 个功能级 patch）
+## Patch 文件清单（canonical overlay + 6 个功能级参考 patch）
 
 ### 1. `01-kimi-coding-plan-runtime.patch`
 
