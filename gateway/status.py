@@ -218,7 +218,11 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     if not pid_path.exists():
         return None
 
-    raw = pid_path.read_text().strip()
+    try:
+        raw = pid_path.read_text().strip()
+    except OSError:
+        # File was deleted between exists() and read_text(), or permission flipped.
+        return None
     if not raw:
         return None
 
@@ -600,7 +604,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                             for _line in _proc_status.read_text(encoding="utf-8").splitlines():
                                 if _line.startswith("State:"):
                                     _state = _line.split()[1]
-                                    if _state in ("T", "t"):  # stopped or tracing stop
+                                    if _state in {"T", "t"}:  # stopped or tracing stop
                                         stale = True
                                     break
                     except (OSError, PermissionError):

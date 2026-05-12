@@ -25,6 +25,11 @@ from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
+from gateway.config import (
+    DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
+    DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
+    DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
+)
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -43,9 +48,9 @@ _COMMENTARY = object()
 @dataclass
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
-    edit_interval: float = 1.0
-    buffer_threshold: int = 40
-    cursor: str = " ▉"
+    edit_interval: float = _DEFAULT_STREAMING_EDIT_INTERVAL
+    buffer_threshold: int = _DEFAULT_STREAMING_BUFFER_THRESHOLD
+    cursor: str = _DEFAULT_STREAMING_CURSOR
     buffer_only: bool = False
     # When >0, the final edit for a streamed response is delivered as a
     # fresh message if the original preview has been visible for at least
@@ -1153,7 +1158,29 @@ class GatewayStreamConsumer:
                     )
                     if result.success:
                         self._already_sent = True
-                        self._last_sent_text = text
+                        # Adapter may have split-and-delivered an oversized
+                        # edit across the original message + N continuations.
+                        # When that happens, ``message_id`` is the LAST visible
+                        # continuation and ``_last_sent_text`` no longer reflects
+                        # the on-screen content (the new message only holds the
+                        # final chunk's text), so subsequent edits must target
+                        # the new id and skip-if-same comparisons must reset.
+                        # Fire on_new_message so tool-progress bubbles linearize
+                        # below the new continuation, not the original.
+                        # ``getattr`` with default keeps backwards compat with
+                        # SimpleNamespace mocks in tests that pre-date the field.
+                        _continuation_ids = getattr(result, "continuation_message_ids", ()) or ()
+                        if (
+                            _continuation_ids
+                            and result.message_id
+                            and result.message_id != self._message_id
+                        ):
+                            self._message_id = str(result.message_id)
+                            self._message_created_ts = time.monotonic()
+                            self._last_sent_text = ""
+                            self._notify_new_message()
+                        else:
+                            self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
