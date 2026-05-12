@@ -271,6 +271,30 @@ class TestGeminiAgentInit:
             resolve_provider_client("gemini")
         mock_openai.assert_called_once()
 
+    def test_google_gemini_cli_resolve_provider_client_uses_cloudcode_client(self):
+        """Auxiliary routing should support Google Gemini CLI OAuth directly."""
+        with patch(
+            "hermes_cli.auth.resolve_gemini_oauth_runtime_credentials",
+            return_value={
+                "api_key": "google-oauth",
+                "base_url": "cloudcode-pa://google",
+                "project_id": "proj-test",
+            },
+        ), patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient") as mock_client:
+            mock_client.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client(
+                "google-gemini-cli", model="gemini-3.1-pro-preview")
+
+        assert client is mock_client.return_value
+        assert model == "gemini-3.1-pro-preview"
+        mock_client.assert_called_once_with(
+            api_key="google-oauth",
+            base_url="cloudcode-pa://google",
+            project_id="proj-test",
+        )
+
 
 # ── models.dev Integration ──
 

@@ -231,6 +231,44 @@ elif (
 
 ---
 
+### 6. `06-gemini-cli-auxiliary-compression.patch`
+
+| 属性 | 值 |
+|------|-----|
+| 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/06-gemini-cli-auxiliary-compression.patch` |
+| 优先级 | critical（auxiliary.compression 依赖 Google Gemini CLI OAuth 时） |
+| 修改类型 | 让 `agent.auxiliary_client.resolve_provider_client()` 识别 `google-gemini-cli`，并路由到 `GeminiCloudCodeClient` |
+| 上游冲突 | 上游 auxiliary resolver 可能只支持 OpenAI-compatible / native Gemini API-key 路径，不识别 Gemini CLI 的 `cloudcode-pa://google` OAuth runtime |
+| 保留理由 | 用户偏好 Gemini CLI 交互式 OAuth/PKCE；`auxiliary.compression` 当前使用 `provider: google-gemini-cli`，需要避免错误回退到 OpenAI client 或缺失 credential |
+
+包含文件：
+
+- `agent/auxiliary_client.py`
+- `tests/hermes_cli/test_gemini_provider.py`
+
+关键行为：
+
+```python
+if provider == "google-gemini-cli":
+    from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+    runtime = resolve_gemini_oauth_runtime_credentials()
+    return GeminiCloudCodeClient(
+        api_key=runtime.get("api_key", "google-oauth"),
+        base_url=runtime.get("base_url") or "cloudcode-pa://google",
+        project_id=runtime.get("project_id"),
+    ), model
+```
+
+验证点：
+
+- `resolve_provider_client("google-gemini-cli", model="gemini-3.1-pro-preview")` 返回 `GeminiCloudCodeClient`。
+- `call_llm(task="compression")` 能按 `~/.hermes/config.yaml` 的 `auxiliary.compression` 路由到 `google-gemini-cli`。
+- 重启 `hermes-gateway.service` 后日志无新的 auxiliary/compression 报错。
+
+---
+
 ## 旧 8 项文件级补丁映射
 
 | 旧文件级补丁 | 新功能级 patch |

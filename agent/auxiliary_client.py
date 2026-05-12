@@ -3024,6 +3024,36 @@ def resolve_provider_client(
             return resolve_provider_client("nous", model, async_mode)
         if provider == "openai-codex":
             return resolve_provider_client("openai-codex", model, async_mode)
+        if provider == "google-gemini-cli":
+            try:
+                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+            except ImportError as exc:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli requested but "
+                    "Gemini Cloud Code support is unavailable: %s", exc)
+                return None, None
+            try:
+                creds = resolve_gemini_oauth_runtime_credentials()
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli requested but "
+                    "OAuth credentials could not be resolved: %s", exc)
+                return None, None
+            final_model = _normalize_resolved_model(
+                model or _get_aux_model_for_provider(provider), provider)
+            client = GeminiCloudCodeClient(
+                api_key=str(creds.get("api_key", "") or "google-oauth"),
+                base_url=str(creds.get("base_url", "") or "cloudcode-pa://google"),
+                project_id=str(creds.get("project_id", "") or ""),
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            if async_mode:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli async auxiliary "
+                    "mode is not supported yet")
+                return None, None
+            return client, final_model
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
