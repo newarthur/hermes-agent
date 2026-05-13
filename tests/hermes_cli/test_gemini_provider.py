@@ -285,10 +285,10 @@ class TestGeminiAgentInit:
             from agent.auxiliary_client import resolve_provider_client
 
             client, model = resolve_provider_client(
-                "google-gemini-cli", model="gemini-3.1-pro-preview")
+                "google-gemini-cli", model="gemini-3-flash-preview")
 
         assert client is mock_client.return_value
-        assert model == "gemini-3.1-pro-preview"
+        assert model == "gemini-3-flash-preview"
         mock_client.assert_called_once_with(
             api_key="google-oauth",
             base_url="cloudcode-pa://google",

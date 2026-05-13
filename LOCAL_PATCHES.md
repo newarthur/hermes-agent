@@ -266,7 +266,7 @@ if provider == "google-gemini-cli":
 
 验证点：
 
-- `resolve_provider_client("google-gemini-cli", model="gemini-3.1-pro-preview")` 返回 `GeminiCloudCodeClient`。
+- `resolve_provider_client("google-gemini-cli", model="gemini-3-flash-preview")` 返回 `GeminiCloudCodeClient`。
 - `call_llm(task="compression")` 能按 `~/.hermes/config.yaml` 的 `auxiliary.compression` 路由到 `google-gemini-cli`。
 - 重启 `hermes-gateway.service` 后日志无新的 auxiliary/compression 报错。
 

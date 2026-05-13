@@ -790,6 +790,88 @@ class ContextCompressor(ContextEngine):
         self.summary_model = ""  # empty = use main model
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
+    def _handle_summary_error(
+        self,
+        e: Exception,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+    ) -> Optional[str]:
+        """Shared fallback / cooldown logic for _generate_summary.
+
+        Called from both the RuntimeError and Exception handlers after an
+        auxiliary-model call fails.  Decides whether to fall back to the main
+        model or enter a cooldown, then either retries immediately or returns
+        ``None``.
+        """
+        _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+        _err_str = str(e).lower()
+        _is_model_not_found = (
+            _status in {404, 503}
+            or "model_not_found" in _err_str
+            or "does not exist" in _err_str
+            or "no available channel" in _err_str
+        )
+        _is_timeout = (
+            _status in {408, 429, 502, 504}
+            or "timeout" in _err_str
+        )
+        _is_json_decode = (
+            isinstance(e, json.JSONDecodeError)
+            or "expecting value" in _err_str
+        )
+        _is_streaming_closed = _is_connection_error(e)
+        if _is_json_decode and not _is_model_not_found and not _is_timeout:
+            logger.error(
+                "Context compression failed: auxiliary LLM returned a "
+                "non-JSON response. provider=%s summary_model=%s "
+                "main_model=%s base_url=%s err=%s",
+                self.provider or "auto",
+                self.summary_model or "(main)",
+                self.model,
+                self.base_url or "default",
+                e,
+            )
+        if (
+            (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
+            and self.summary_model
+            and self.summary_model != self.model
+            and not getattr(self, "_summary_model_fallen_back", False)
+        ):
+            if _is_json_decode:
+                _reason = "returned invalid JSON"
+            elif _is_model_not_found:
+                _reason = "unavailable"
+            elif _is_streaming_closed:
+                _reason = "closed stream prematurely"
+            else:
+                _reason = "timed out"
+            self._fallback_to_main_for_compression(e, _reason)
+            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+
+        # Unknown-error best-effort retry on main model.
+        if (
+            self.summary_model
+            and self.summary_model != self.model
+            and not getattr(self, "_summary_model_fallen_back", False)
+        ):
+            self._fallback_to_main_for_compression(e, "failed")
+            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+
+        # Transient errors — shorter cooldown for JSON decode and streaming-closed.
+        _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
+        self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
+        err_text = str(e).strip() or e.__class__.__name__
+        if len(err_text) > 220:
+            err_text = err_text[:217].rstrip() + "..."
+        self._last_summary_error = err_text
+        logging.warning(
+            "Failed to generate context summary: %s. "
+            "Further summary attempts paused for %d seconds.",
+            e,
+            _transient_cooldown,
+        )
+        return None
+
     def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -962,113 +1044,33 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
-        except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            self._last_summary_error = "no auxiliary LLM provider configured"
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
-        except Exception as e:
-            # If the summary model is different from the main model and the
-            # error looks permanent (model not found, 503, 404), fall back to
-            # using the main model instead of entering cooldown that leaves
-            # context growing unbounded.  (#8620 sub-issue 4)
-            _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-            _err_str = str(e).lower()
-            _is_model_not_found = (
-                _status in {404, 503}
-                or "model_not_found" in _err_str
-                or "does not exist" in _err_str
-                or "no available channel" in _err_str
+        except RuntimeError as _rte:
+            # RuntimeError from auxiliary_client can mean either:
+            #   A) truly no provider configured ("No LLM provider configured...")
+            #   B) a provider *was* found but the call itself failed and raised
+            #      RuntimeError (e.g. CodeAssistError from google-gemini-cli).
+            # Only treat (A) as a configuration gap; everything else should go
+            # through the normal Exception fallback / cooldown path so we don't
+            # mis-report a live-provider failure as "no provider configured".
+            _rte_str = str(_rte).lower()
+            _no_provider_phrases = (
+                "no llm provider configured",
+                "no provider available",
+                "could not resolve",
+                "could not be rebuilt",
             )
-            _is_timeout = (
-                _status in {408, 429, 502, 504}
-                or "timeout" in _err_str
-            )
-            # Non-JSON / malformed-body responses from misconfigured providers
-            # or proxies (e.g. an HTML 502 page returned with
-            # ``Content-Type: application/json``) bubble up as
-            # ``json.JSONDecodeError`` from the OpenAI SDK's ``response.json()``,
-            # or as a wrapping ``APIResponseValidationError`` whose message
-            # carries the substring "expecting value".  Treat these like a
-            # transient provider failure: one retry on the main model, then a
-            # short cooldown.  Issue #22244.
-            _is_json_decode = (
-                isinstance(e, json.JSONDecodeError)
-                or "expecting value" in _err_str
-            )
-            # httpcore / httpx streaming premature-close errors surface as
-            # ConnectionError subclasses or plain Exception with characteristic
-            # substrings ("incomplete chunked read", "peer closed connection",
-            # "response ended prematurely", "unexpected eof").  These are
-            # transient network events; treat them like a timeout so we fall
-            # back to the main model instead of entering a 60-second cooldown.
-            # See issue #18458.
-            _is_streaming_closed = _is_connection_error(e)
-            if _is_json_decode and not _is_model_not_found and not _is_timeout:
-                logger.error(
-                    "Context compression failed: auxiliary LLM returned a "
-                    "non-JSON response. provider=%s summary_model=%s "
-                    "main_model=%s base_url=%s err=%s",
-                    self.provider or "auto",
-                    self.summary_model or "(main)",
-                    self.model,
-                    self.base_url or "default",
-                    e,
-                )
-            if (
-                (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
-                and self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
-                if _is_json_decode:
-                    _reason = "returned invalid JSON"
-                elif _is_model_not_found:
-                    _reason = "unavailable"
-                elif _is_streaming_closed:
-                    _reason = "closed stream prematurely"
-                else:
-                    _reason = "timed out"
-                self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
-
-            # Unknown-error best-effort retry on main model.  Losing N turns of
-            # context is almost always worse than one extra summary attempt, so
-            # if we haven't already fallen back and the summary model differs
-            # from the main model, try once more on main before entering
-            # cooldown.  Errors that DID match _is_model_not_found above are
-            # already handled by the fast-path retry; this branch catches
-            # everything else (400s, provider-specific "no route" strings,
-            # aggregator rejections, etc.) where auto-retry is still safer
-            # than dropping the turns.
-            if (
-                self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
-                self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
-
-            # Transient errors (timeout, rate limit, network, JSON decode,
-            # streaming premature-close) — shorter cooldown for JSON decode and
-            # streaming-closed since those conditions can self-resolve quickly.
-            _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
-            self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
-            err_text = str(e).strip() or e.__class__.__name__
-            if len(err_text) > 220:
-                err_text = err_text[:217].rstrip() + "..."
-            self._last_summary_error = err_text
-            logging.warning(
-                "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
-                e,
-                _transient_cooldown,
-            )
-            return None
+            if any(p in _rte_str for p in _no_provider_phrases):
+                self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+                self._last_summary_error = "no auxiliary LLM provider configured"
+                logging.warning("Context compression: no provider available for "
+                                "summary. Middle turns will be dropped without summary "
+                                "for %d seconds.",
+                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+                return None
+            # Not a configuration gap — route through the shared handler.
+            return self._handle_summary_error(_rte, turns_to_summarize, focus_topic=focus_topic)
+        except Exception as _e:
+            return self._handle_summary_error(_e, turns_to_summarize, focus_topic=focus_topic)
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:

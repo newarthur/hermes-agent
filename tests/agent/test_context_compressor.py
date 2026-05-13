@@ -247,6 +247,123 @@ class TestNonStringContent:
         }
 
 
+class TestRuntimeErrorMisreportedAsNoProvider:
+    """RuntimeError from auxiliary_client must NOT be blanket-treated as
+    'no provider configured'.  CodeAssistError (a RuntimeError subclass)
+    and other provider-call failures should go through the normal fallback
+    / cooldown path instead of returning None with the misleading message
+    'no auxiliary LLM provider configured'."""
+
+    def _msgs(self):
+        return [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+    def test_code_assist_error_falls_back_to_main(self):
+        """CodeAssistError (RuntimeError subclass) from a live google-gemini-cli
+        provider must trigger retry-on-main, not the 'no provider' path."""
+        from agent.google_code_assist import CodeAssistError
+
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via main"
+
+        err = CodeAssistError(
+            "VPC-SC policy violation: project not whitelisted",
+            code="code_assist_vpc_sc",
+            status_code=403,
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="gemini-aux",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[err, mock_ok],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs.get("model") == "gemini-aux"
+        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert result is not None
+        assert "summary via main" in result
+
+    def test_runtime_error_no_provider_phrase_uses_long_cooldown(self):
+        """A RuntimeError whose message contains the canonical 'no provider'
+        phrase must still enter the 600-second configuration-gap cooldown."""
+        err = RuntimeError(
+            "No LLM provider configured for task=compression provider=auto. Run: hermes setup"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=err,
+        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
+            result = c._generate_summary(self._msgs())
+
+        assert result is None
+        assert c._last_summary_error == "no auxiliary LLM provider configured"
+        assert c._summary_failure_cooldown_until == 1000.0 + 600
+
+    def test_runtime_error_provider_rebuild_fails_uses_long_cooldown(self):
+        """RuntimeError about provider rebuild failure is also a config gap."""
+        err = RuntimeError(
+            "Auxiliary call: provider openrouter could not be rebuilt after recovery"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=err,
+        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
+            result = c._generate_summary(self._msgs())
+
+        assert result is None
+        assert c._last_summary_error == "no auxiliary LLM provider configured"
+
+    def test_runtime_error_generic_goes_to_fallback(self):
+        """A generic RuntimeError without the 'no provider' phrases should be
+        re-raised as Exception and hit the fallback/cooldown branch."""
+        err = RuntimeError("Something weird happened inside the SDK")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="aux-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[err, Exception("main also failed")],
+        ) as mock_call, patch("agent.context_compressor.time.monotonic", return_value=1000.0):
+            result = c._generate_summary(self._msgs())
+
+        # First call on aux-model failed; second call on main-model also failed.
+        assert mock_call.call_count == 2
+        assert result is None
+        # Should have entered the normal 60-second cooldown (not the 600s config gap)
+        assert c._summary_failure_cooldown_until == 1060.0
+        assert c._last_summary_error is not None
+        # The last error recorded is from the main-model fallback attempt.
+        # The original RuntimeError should have triggered the fallback.
+        assert "main also failed" in c._last_summary_error.lower()
+        # Verify fallback happened: summary_model cleared
+        assert c.summary_model == ""
+        assert getattr(c, "_summary_model_fallen_back", False)
+
+
 class TestSummaryFailureCooldown:
     def test_summary_failure_enters_cooldown_and_skips_retry(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
