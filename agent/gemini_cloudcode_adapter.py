@@ -488,9 +488,13 @@ def _make_stream_chunk(
 ) -> _GeminiStreamChunk:
     delta_kwargs: Dict[str, Any] = {
         "role": "assistant",
-        "content": content if content else None,
+        "content": None,
         "tool_calls": None,
+        "reasoning": None,
+        "reasoning_content": None,
     }
+    if content:
+        delta_kwargs["content"] = content
     if tool_call_delta is not None:
         delta_kwargs["tool_calls"] = [SimpleNamespace(
             index=tool_call_delta.get("index", 0),

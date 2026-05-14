@@ -2414,30 +2414,31 @@ def _prompt_provider_choice(choices, *, default=0):
 def _model_flow_openrouter(config, current_model=""):
     """OpenRouter provider: ensure API key, then pick model."""
     from hermes_cli.auth import (
+        ProviderConfig,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("OPENROUTER_API_KEY")
-    if not api_key:
-        print("No OpenRouter API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand. The
+    # previous bypass-when-key-exists branch left no way to recover from a
+    # bad paste short of re-running `hermes setup` from scratch. OpenRouter
+    # isn't in PROVIDER_REGISTRY so we synthesize a minimal pconfig.
+    pconfig = ProviderConfig(
+        id="openrouter",
+        name="OpenRouter",
+        auth_type="api_key",
+        api_key_env_vars=("OPENROUTER_API_KEY",),
+    )
+    existing_key = get_env_value("OPENROUTER_API_KEY") or ""
+    if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("OpenRouter API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("OPENROUTER_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="openrouter")
+    if abort:
+        return
 
     from hermes_cli.models import model_ids, get_pricing_for_provider
 
@@ -2473,33 +2474,26 @@ def _model_flow_openrouter(config, current_model=""):
 def _model_flow_ai_gateway(config, current_model=""):
     """Vercel AI Gateway provider: ensure API key, then pick model with pricing."""
     from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("AI_GATEWAY_API_KEY")
-    if not api_key:
-        print("No Vercel AI Gateway API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand.
+    pconfig = PROVIDER_REGISTRY["ai-gateway"]
+    existing_key = get_env_value("AI_GATEWAY_API_KEY") or ""
+    if not existing_key:
         print(
             "Create API key here: https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway&title=AI+Gateway"
         )
         print("Add a payment method to get $5 in free credits.")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("AI Gateway API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("AI_GATEWAY_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="ai-gateway")
+    if abort:
+        return
 
     from hermes_cli.models import ai_gateway_model_ids, get_pricing_for_provider
 
@@ -3079,6 +3073,21 @@ def _model_flow_custom(config):
             else:
                 print(f"  If /v1 should not be in the base URL, try: {suggested}")
 
+    # Prompt for API compatibility mode explicitly so codex-compatible custom
+    # providers don't silently fall back to chat_completions.
+    current_model_cfg = config.get("model")
+    current_api_mode = ""
+    if isinstance(current_model_cfg, dict):
+        current_api_mode = str(current_model_cfg.get("api_mode") or "").strip()
+    api_mode = _prompt_custom_api_mode_selection(
+        effective_url,
+        current_api_mode=current_api_mode,
+    )
+    if api_mode:
+        print(f"  API mode: {api_mode}")
+    else:
+        print("  API mode: auto-detect")
+
     # Select model — use probe results when available, fall back to manual input
     model_name = ""
     detected_models = probe.get("models") or []
@@ -3142,7 +3151,10 @@ def _model_flow_custom(config):
         model["base_url"] = effective_url
         if effective_key:
             model["api_key"] = effective_key
-        model.pop("api_mode", None)  # let runtime auto-detect from URL
+        if api_mode:
+            model["api_mode"] = api_mode
+        else:
+            model.pop("api_mode", None)
         save_config(cfg)
         deactivate_provider()
 
@@ -3165,7 +3177,10 @@ def _model_flow_custom(config):
         _caller_model["base_url"] = effective_url
         if effective_key:
             _caller_model["api_key"] = effective_key
-        _caller_model.pop("api_mode", None)
+        if api_mode:
+            _caller_model["api_mode"] = api_mode
+        else:
+            _caller_model.pop("api_mode", None)
         config["model"] = _caller_model
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
@@ -3176,7 +3191,78 @@ def _model_flow_custom(config):
         model_name or "",
         context_length=context_length,
         name=display_name,
+        api_mode=api_mode,
     )
+
+
+def _prompt_custom_api_mode_selection(base_url: str, current_api_mode: str = "") -> Optional[str]:
+    """Prompt for a custom provider API mode.
+
+    Returns an explicit mode string, or None to keep auto-detect behavior.
+    """
+    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+    detected_mode = _detect_api_mode_for_url(base_url)
+    normalized_current = str(current_api_mode or "").strip().lower()
+    default_mode = normalized_current or detected_mode or ""
+
+    mode_options = [
+        (
+            "",
+            "Auto-detect",
+            "Use Hermes URL heuristics; best for standard OpenAI-compatible endpoints.",
+        ),
+        (
+            "chat_completions",
+            "Chat Completions",
+            "Use /chat/completions for standard OpenAI-compatible servers.",
+        ),
+        (
+            "codex_responses",
+            "Responses / Codex",
+            "Use /responses for Codex-compatible tool-calling backends.",
+        ),
+        (
+            "anthropic_messages",
+            "Anthropic Messages",
+            "Use /v1/messages for Anthropic-compatible endpoints.",
+        ),
+    ]
+
+    print()
+    print("Select API compatibility mode:")
+    for idx, (value, label, description) in enumerate(mode_options, 1):
+        markers = []
+        if value == detected_mode:
+            markers.append("detected")
+        if value == default_mode:
+            markers.append("current")
+        suffix = f" [{' / '.join(markers)}]" if markers else ""
+        print(f"  {idx}. {label}{suffix}")
+        print(f"     {description}")
+
+    try:
+        raw = input(
+            "Choice [1-4, Enter to keep current/detected]: "
+        ).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        raise
+
+    if not raw:
+        return default_mode or None
+
+    if raw in {"1", "auto", "detect", "auto-detect"}:
+        return None
+    if raw in {"2", "chat", "chat_completions", "completions"}:
+        return "chat_completions"
+    if raw in {"3", "responses", "codex", "codex_responses"}:
+        return "codex_responses"
+    if raw in {"4", "anthropic", "anthropic_messages", "messages"}:
+        return "anthropic_messages"
+
+    print(f"Invalid API mode choice: {raw}. Falling back to auto-detect.")
+    return None
 
 
 def _auto_provider_name(base_url: str) -> str:
@@ -3214,12 +3300,12 @@ def _custom_provider_api_key_config_value(provider_info, resolved_api_key=""):
 
 
 def _save_custom_provider(
-    base_url, api_key="", model="", context_length=None, name=None
+    base_url, api_key="", model="", context_length=None, name=None, api_mode=None
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
     Deduplicates by base_url — if the URL already exists, updates the
-    model name and context_length but doesn't add a duplicate entry.
+    model name, context_length, and api_mode but doesn't add a duplicate entry.
     Uses *name* when provided, otherwise auto-generates from the URL.
     """
     from hermes_cli.config import load_config, save_config
@@ -3245,6 +3331,13 @@ def _save_custom_provider(
                 models_cfg[model] = {"context_length": context_length}
                 entry["models"] = models_cfg
                 changed = True
+            if api_mode:
+                if entry.get("api_mode") != api_mode:
+                    entry["api_mode"] = api_mode
+                    changed = True
+            elif "api_mode" in entry:
+                entry.pop("api_mode", None)
+                changed = True
             if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
@@ -3259,6 +3352,8 @@ def _save_custom_provider(
         entry["api_key"] = api_key
     if model:
         entry["model"] = model
+    if api_mode:
+        entry["api_mode"] = api_mode
     if model and context_length:
         entry["models"] = {model: {"context_length": context_length}}
 
@@ -3712,7 +3807,7 @@ def _model_flow_named_custom(config, provider_info):
                 save_config(cfg)
     else:
         # Save model name to the custom_providers entry for next time
-        _save_custom_provider(base_url, config_api_key, model_name)
+        _save_custom_provider(base_url, config_api_key, model_name, api_mode=api_mode)
 
     print(f"\n✅ Model set to: {model_name}")
     print(f"   Provider: {name} ({base_url})")
@@ -4869,6 +4964,37 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         )
         if model_list:
             print(f"  Found {len(model_list)} model(s) from Ollama Cloud")
+    elif provider_id == "novita":
+        from hermes_cli.models import fetch_api_models
+
+        api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
+        curated = _PROVIDER_MODELS.get(provider_id, [])
+        live_models = fetch_api_models(api_key_for_probe, effective_base)
+        if live_models:
+            model_list = live_models
+            print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+        else:
+            mdev_models: list = []
+            try:
+                from agent.models_dev import list_agentic_models
+
+                mdev_models = list_agentic_models(provider_id)
+            except Exception:
+                pass
+            if mdev_models:
+                seen = {m.lower() for m in mdev_models}
+                model_list = list(mdev_models)
+                for m in curated:
+                    if m.lower() not in seen:
+                        model_list.append(m)
+                        seen.add(m.lower())
+                print(f"  Found {len(model_list)} model(s) from models.dev registry")
+            else:
+                model_list = curated
+                if model_list:
+                    print(
+                        f'  Showing {len(model_list)} curated models — use "Enter custom model name" for others.'
+                    )
     else:
         curated = _PROVIDER_MODELS.get(provider_id, [])
 
@@ -6701,6 +6827,74 @@ def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
         pass
 
 
+def _refresh_active_lazy_features() -> None:
+    """Refresh lazy-installed backends after a code update.
+
+    When pyproject.toml's ``[all]`` extra was slimmed down (May 2026), most
+    optional backends moved to ``tools/lazy_deps.py`` and only install on
+    first use. ``hermes update`` runs ``uv pip install -e .[all]`` which
+    leaves those packages untouched — so if we bump a pin in
+    :data:`LAZY_DEPS` (CVE response, transitive bug fix), users who already
+    activated the backend keep the stale version forever.
+
+    This function asks lazy_deps which features the user has previously
+    activated and reinstalls them under the current pins. Features the
+    user never enabled stay quiet — no churn for cold backends.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from tools import lazy_deps
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (import failed): %s", exc)
+        return
+
+    try:
+        active = lazy_deps.active_features()
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
+        return
+
+    if not active:
+        return
+
+    print()
+    print(f"→ Refreshing {len(active)} active lazy backend(s)...")
+
+    try:
+        results = lazy_deps.refresh_active_features(prompt=False)
+    except Exception as exc:
+        # refresh_active_features is documented as never-raise, but defend
+        # the update flow against future regressions.
+        print(f"  ⚠ Lazy refresh failed unexpectedly: {exc}")
+        return
+
+    refreshed = [f for f, s in results.items() if s == "refreshed"]
+    current = [f for f, s in results.items() if s == "current"]
+    failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
+    skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
+
+    if refreshed:
+        print(f"  ↑ {len(refreshed)} refreshed: {', '.join(refreshed)}")
+    if current:
+        print(f"  ✓ {len(current)} already current")
+    if skipped:
+        # Most common reason: security.allow_lazy_installs=false. Show one
+        # line so the user knows why; not an error.
+        names = ", ".join(f for f, _ in skipped)
+        reason = skipped[0][1].split(": ", 1)[-1]
+        print(f"  · {len(skipped)} skipped ({reason}): {names}")
+    if failed:
+        for feature, status in failed:
+            reason = status.split(": ", 1)[-1]
+            # Clip noisy pip stderr to keep update output legible.
+            if len(reason) > 200:
+                reason = reason[:200] + "..."
+            print(f"  ⚠ {feature} failed to refresh: {reason}")
+        print("  Backends keep their previously-installed version; rerun")
+        print("  `hermes update` once the upstream issue is resolved.")
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -7622,6 +7816,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
                 _install_psutil_android_compat(pip_cmd)
             _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
+
+        _refresh_active_lazy_features()
 
         _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
@@ -9168,7 +9364,7 @@ def _build_provider_choices() -> list[str]:
             "auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot",
             "anthropic", "gemini", "google-gemini-cli", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
-            "stepfun", "minimax", "minimax-cn", "kilocode", "xiaomi", "arcee",
+            "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
         ]
 
@@ -9188,10 +9384,10 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "kanban", "login", "logout", "logs", "mcp", "memory", "model",
-        "pairing", "plugins", "profile", "sessions", "setup", "skills",
-        "slack", "status", "tools", "uninstall", "update", "version",
-        "webhook", "whatsapp", "chat",
+        "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
+        "model", "pairing", "plugins", "profile", "sessions", "setup",
+        "skills", "slack", "status", "tools", "uninstall", "update",
+        "version", "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
