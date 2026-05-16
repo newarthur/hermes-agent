@@ -199,9 +199,40 @@ def get_managed_update_command() -> Optional[str]:
     return None
 
 
+def detect_install_method(project_root: Optional[Path] = None) -> str:
+    """Detect how Hermes was installed: 'nixos', 'homebrew', 'git', or 'pip'."""
+    managed = get_managed_system()
+    if managed:
+        return managed.lower().replace(" ", "-")
+    if project_root is None:
+        project_root = Path(__file__).parent.parent.resolve()
+    if (project_root / ".git").is_dir():
+        return "git"
+    return "pip"
+
+
+def recommended_update_command_for_method(method: str) -> str:
+    """Return the update command for a given install method."""
+    if method == "nixos":
+        return "sudo nixos-rebuild switch"
+    if method == "homebrew":
+        return "brew upgrade hermes-agent"
+    if method == "pip":
+        import shutil
+        uv = shutil.which("uv")
+        if uv:
+            return "uv pip install --upgrade hermes-agent"
+        return "pip install --upgrade hermes-agent"
+    return "hermes update"
+
+
 def recommended_update_command() -> str:
     """Return the best update command for the current installation."""
-    return get_managed_update_command() or "hermes update"
+    managed_cmd = get_managed_update_command()
+    if managed_cmd:
+        return managed_cmd
+    method = detect_install_method()
+    return recommended_update_command_for_method(method)
 
 
 def format_managed_message(action: str = "modify this Hermes installation") -> str:
@@ -401,7 +432,10 @@ def ensure_hermes_home():
     else:
         home.mkdir(parents=True, exist_ok=True)
         _secure_dir(home)
-        for subdir in ("cron", "sessions", "logs", "logs/curator", "memories"):
+        for subdir in (
+            "cron", "sessions", "logs", "logs/curator", "memories",
+            "pairing", "hooks", "image_cache", "audio_cache", "skills",
+        ):
             d = home / subdir
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
@@ -1251,6 +1285,8 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
+        "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
+        "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
@@ -2133,22 +2169,6 @@ OPTIONAL_ENV_VARS = {
         "prompt": "FAL API key",
         "url": "https://fal.ai/",
         "tools": ["image_generate", "video_generate"],
-        "password": True,
-        "category": "tool",
-    },
-    "TINKER_API_KEY": {
-        "description": "Tinker API key for RL training",
-        "prompt": "Tinker API key",
-        "url": "https://tinker-console.thinkingmachines.ai/keys",
-        "tools": ["rl_start_training", "rl_check_status", "rl_stop_training"],
-        "password": True,
-        "category": "tool",
-    },
-    "WANDB_API_KEY": {
-        "description": "Weights & Biases API key for experiment tracking",
-        "prompt": "WandB API key",
-        "url": "https://wandb.ai/authorize",
-        "tools": ["rl_get_results", "rl_check_status"],
         "password": True,
         "category": "tool",
     },
@@ -4988,8 +5008,7 @@ def set_config_value(key: str, value: str):
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
-        'GITHUB_TOKEN', 'HONCHO_API_KEY', 'WANDB_API_KEY',
-        'TINKER_API_KEY',
+        'GITHUB_TOKEN', 'HONCHO_API_KEY',
     ]
     
     if key.upper() in api_keys or key.upper().endswith(('_API_KEY', '_TOKEN')) or key.upper().startswith('TERMINAL_SSH'):
