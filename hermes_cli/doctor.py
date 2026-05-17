@@ -152,6 +152,30 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
     return updated_available, updated_unavailable
 
 
+def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool:
+    """Return True when a direct API-key probe failure is non-blocking.
+
+    Some provider families support both a direct API-key path and a separate
+    OAuth runtime path. When the OAuth path is already healthy, doctor should
+    still show a failed API-key connectivity row, but it should not promote
+    that direct-key problem into the final blocking summary.
+    """
+    try:
+        from hermes_cli.auth import (
+            get_gemini_oauth_auth_status,
+            get_minimax_oauth_auth_status,
+        )
+    except Exception:
+        return False
+
+    normalized = (provider_label or "").strip().lower()
+    if normalized in {"google / gemini", "gemini"}:
+        return bool((get_gemini_oauth_auth_status() or {}).get("logged_in"))
+    if normalized == "minimax":
+        return bool((get_minimax_oauth_auth_status() or {}).get("logged_in"))
+    return False
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -1049,10 +1073,20 @@ def run_doctor(args):
     if terminal_env == "ssh":
         ssh_host = os.getenv("TERMINAL_SSH_HOST")
         if ssh_host:
+            ssh_user = os.getenv("TERMINAL_SSH_USER")
+            ssh_port = os.getenv("TERMINAL_SSH_PORT")
+            ssh_key = os.getenv("TERMINAL_SSH_KEY")
+            target = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+            cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+            if ssh_port:
+                cmd += ["-p", ssh_port]
+            if ssh_key:
+                cmd += ["-i", os.path.expanduser(ssh_key)]
+            cmd += [target, "echo ok"]
             # Try to connect
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=15
@@ -1450,6 +1484,15 @@ def run_doctor(args):
             }
             if base_url_host_matches(base, "api.kimi.com"):
                 headers["User-Agent"] = "claude-code/0.1.0"
+            # Google's Generative Language API (generativelanguage.googleapis.com)
+            # rejects ``Authorization: Bearer <api-key>`` with 401
+            # ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` — that header is reserved for
+            # OAuth 2 access tokens, not plain API keys. Plain keys use
+            # ``x-goog-api-key`` (or ``?key=``). Without this, a perfectly valid
+            # GOOGLE_API_KEY/GEMINI_API_KEY always shows red in ``hermes doctor``.
+            if url and base_url_host_matches(url, "generativelanguage.googleapis.com"):
+                headers.pop("Authorization", None)
+                headers["x-goog-api-key"] = key
             r = httpx.get(url, headers=headers, timeout=10)
             if (
                 pname == "Alibaba/DashScope"
@@ -1594,7 +1637,10 @@ def run_doctor(args):
                 print(f"  {_glyph} {_label} {_detail}")
             else:
                 print(f"  {_glyph} {_label}")
-        for _issue in _r.issues:
+        _issues_to_add = list(_r.issues)
+        if _issues_to_add and _has_healthy_oauth_fallback_for_apikey_provider(_r.label):
+            _issues_to_add = []
+        for _issue in _issues_to_add:
             issues.append(_issue)
 
     # =========================================================================
