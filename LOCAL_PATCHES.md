@@ -326,7 +326,7 @@ python3 -m py_compile \
   gateway/platforms/telegram.py \
   run_agent.py
 
-PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
@@ -363,7 +363,7 @@ python3 -m py_compile \
   gateway/platforms/telegram.py \
   run_agent.py
 
-PYTEST_ADDOPTS='' uv run --frozen --extra dev python -m pytest -o addopts='' \
+PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
