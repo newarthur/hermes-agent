@@ -431,6 +431,18 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
+        # ``all`` intentionally expands from the live environment at fire time;
+        # isolate this exact assertion from any home channels configured on the
+        # developer/CI machine running the test.
+        for var in (
+            "TELEGRAM_HOME_CHANNEL", "DISCORD_HOME_CHANNEL", "SLACK_HOME_CHANNEL",
+            "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
+            "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
+            "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
+            "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL",
+            "WHATSAPP_HOME_CHANNEL",
+        ):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
