@@ -2628,12 +2628,20 @@ class AIAgent:
             return False
 
         try:
-            from hermes_cli.auth import resolve_nous_runtime_credentials
+            from hermes_cli.auth import (
+                NOUS_INFERENCE_AUTH_MODE_AUTO,
+                NOUS_INFERENCE_AUTH_MODE_LEGACY,
+                resolve_nous_runtime_credentials,
+            )
 
             creds = resolve_nous_runtime_credentials(
                 min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-                force_mint=force,
+                inference_auth_mode=(
+                    NOUS_INFERENCE_AUTH_MODE_LEGACY
+                    if force
+                    else NOUS_INFERENCE_AUTH_MODE_AUTO
+                ),
             )
         except Exception as exc:
             logger.debug("Nous credential refresh failed: %s", exc)
@@ -3601,15 +3609,17 @@ class AIAgent:
         ``reasoning_content`` on every assistant tool-call message; omitting
         it causes the next replay to fail with HTTP 400.
 
-        Also detects Kimi models served through third-party providers (e.g.
-        ollama-cloud) by matching ``kimi`` in the model name.
+        Detection is host-driven, not model-name-driven: aggregators like
+        OpenRouter that re-export Kimi/Moonshot models speak their own
+        protocol and reject ``reasoning_content`` echoes. We only enable the
+        kimi-reasoning replay when the request actually targets a
+        kimi/moonshot endpoint or the dedicated kimi-coding provider.
         """
         return (
             self.provider in {"kimi-coding", "kimi-coding-cn"}
             or base_url_host_matches(self.base_url, "api.kimi.com")
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
-            or "kimi" in (self.model or "").lower()
         )
 
     def _needs_deepseek_tool_reasoning(self) -> bool:
