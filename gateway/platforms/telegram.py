@@ -49,8 +49,19 @@ except ImportError:
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
-    ParseMode = None
-    ChatType = None
+    class _MockParseMode:
+        MARKDOWN_V2 = "MarkdownV2"
+        MARKDOWN = "Markdown"
+        HTML = "HTML"
+
+    class _MockChatType:
+        GROUP = "group"
+        SUPERGROUP = "supergroup"
+        CHANNEL = "channel"
+        PRIVATE = "private"
+
+    ParseMode = _MockParseMode
+    ChatType = _MockChatType
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.

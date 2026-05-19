@@ -33,26 +33,56 @@ def _ensure_telegram_mock():
         return # Real library installed
 
     telegram_mod = MagicMock()
+    constants_mod = MagicMock()
+    ext_mod = MagicMock()
+    request_mod = MagicMock()
+    class _FakeTelegramInlineKeyboardButton:
+        def __init__(self, text, callback_data=None, **kwargs):
+            self.text = text
+            self.callback_data = callback_data
+            self.kwargs = kwargs
+
+    class _FakeTelegramInlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
     telegram_mod.Update = MagicMock()
     telegram_mod.Update.ALL_TYPES = []
     telegram_mod.Bot = MagicMock
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.ext.Application = MagicMock()
-    telegram_mod.ext.Application.builder = MagicMock
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.ext.MessageHandler = MagicMock
-    telegram_mod.ext.CommandHandler = MagicMock
-    telegram_mod.ext.filters = MagicMock()
-    telegram_mod.request.HTTPXRequest = MagicMock
+    telegram_mod.Message = MagicMock
+    telegram_mod.InlineKeyboardButton = _FakeTelegramInlineKeyboardButton
+    telegram_mod.InlineKeyboardMarkup = _FakeTelegramInlineKeyboardMarkup
+    constants_mod.ParseMode = SimpleNamespace(
+        MARKDOWN_V2="MarkdownV2",
+        MARKDOWN="Markdown",
+        HTML="HTML",
+    )
+    constants_mod.ChatType = SimpleNamespace(
+        GROUP="group",
+        SUPERGROUP="supergroup",
+        CHANNEL="channel",
+        PRIVATE="private",
+    )
+    ext_mod.Application = MagicMock()
+    ext_mod.Application.builder = MagicMock
+    ext_mod.ContextTypes = SimpleNamespace(DEFAULT_TYPE=type(None))
+    ext_mod.MessageHandler = MagicMock
+    ext_mod.CommandHandler = MagicMock
+    ext_mod.CallbackQueryHandler = MagicMock
+    ext_mod.filters = MagicMock()
+    request_mod.HTTPXRequest = MagicMock
+    telegram_mod.constants = constants_mod
+    telegram_mod.ext = ext_mod
+    telegram_mod.request = request_mod
 
-    for name in (
-        "telegram",
-        "telegram.constants",
-        "telegram.ext",
-        "telegram.ext.filters",
-        "telegram.request",
+    for name, mod in (
+        ("telegram", telegram_mod),
+        ("telegram.constants", constants_mod),
+        ("telegram.ext", ext_mod),
+        ("telegram.ext.filters", ext_mod.filters),
+        ("telegram.request", request_mod),
     ):
-        sys.modules.setdefault(name, telegram_mod)
+        sys.modules[name] = mod
 
 
 # Ensure discord module is available (mock it if not installed)
@@ -142,7 +172,9 @@ def _ensure_discord_mock():
             self.callback = callback
             self.parent = parent
 
-    discord_mod = MagicMock()
+    discord_mod = sys.modules.get("discord")
+    if discord_mod is None:
+        discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.DMChannel = type("DMChannel", (), {})
     discord_mod.Thread = type("Thread", (), {})
