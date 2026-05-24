@@ -311,6 +311,16 @@ TOOL_CATEGORIES = {
     "image_gen": {
         "name": "Image Generation",
         "icon": "🎨",
+        # Per-provider rows for FAL.ai (`plugins/image_gen/fal`), OpenAI,
+        # OpenAI Codex, and xAI are injected at runtime from each
+        # ``plugins.image_gen.<vendor>`` package via
+        # ``_plugin_image_gen_providers()`` in ``_visible_providers``.
+        # Only non-provider UX setup-flow rows remain here:
+        #   - "Nous Subscription" — managed FAL billed via the Nous
+        #     subscription (requires_nous_auth + override_env_vars).
+        #     Uses the fal plugin as the underlying backend but has a
+        #     distinct setup UX.
+        # Mirrors the shape browser/video_gen ship today.
         "providers": [
             {
                 "name": "Nous Subscription",
@@ -320,15 +330,6 @@ TOOL_CATEGORIES = {
                 "requires_nous_auth": True,
                 "managed_nous_feature": "image_gen",
                 "override_env_vars": ["FAL_KEY"],
-                "imagegen_backend": "fal",
-            },
-            {
-                "name": "FAL.ai",
-                "badge": "paid",
-                "tag": "Pick from flux-2-klein, flux-2-pro, gpt-image, nano-banana, etc.",
-                "env_vars": [
-                    {"key": "FAL_KEY", "prompt": "FAL API key", "url": "https://fal.ai/dashboard/keys"},
-                ],
                 "imagegen_backend": "fal",
             },
         ],
@@ -1567,12 +1568,9 @@ def _plugin_image_gen_providers() -> list[dict]:
     Each returned dict looks like a regular ``TOOL_CATEGORIES`` provider
     row but carries an ``image_gen_plugin_name`` marker so downstream
     code (config writing, model picker) knows to route through the
-    plugin registry instead of the in-tree FAL backend.
-
-    FAL is skipped — it's already exposed by the hardcoded
-    ``TOOL_CATEGORIES["image_gen"]`` entries. When FAL gets ported to
-    a plugin in a follow-up PR, the hardcoded entries go away and this
-    function surfaces it alongside OpenAI automatically.
+    plugin registry. Every image-gen backend is a plugin now — there
+    are no hardcoded rows left in ``TOOL_CATEGORIES["image_gen"]`` for
+    this function to dedupe against (see issue #26241).
     """
     try:
         from agent.image_gen_registry import list_providers
@@ -1585,9 +1583,6 @@ def _plugin_image_gen_providers() -> list[dict]:
 
     rows: list[dict] = []
     for provider in providers:
-        if getattr(provider, "name", None) == "fal":
-            # FAL has its own hardcoded rows today.
-            continue
         try:
             schema = provider.get_setup_schema()
         except Exception:
@@ -1930,6 +1925,16 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
         print()
 
         # Plain text labels only (no ANSI codes in menu items)
+        # When the user is logged into Nous, surface a marker on providers
+        # whose access is included in their subscription so it's visually
+        # obvious which options cost extra vs. cost nothing on top of Nous.
+        try:
+            _nous_logged_in = bool(
+                get_nous_subscription_features(config).nous_auth_present
+            )
+        except Exception:
+            _nous_logged_in = False
+
         provider_choices = []
         for p in providers:
             badge = f" [{p['badge']}]" if p.get("badge") else ""
@@ -1943,7 +1948,15 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
                     configured = ""
                 else:
                     configured = " [configured]"
-            provider_choices.append(f"{p['name']}{badge}{tag}{configured}")
+            # Highlight Nous-managed entries when the user has Portal auth.
+            # curses_radiolist can't render ANSI inside item strings, so we
+            # use a plain unicode star + parenthetical phrase. Suppressed
+            # when no Portal auth is present so non-subscribers see the
+            # picker unchanged.
+            sub_marker = ""
+            if _nous_logged_in and p.get("managed_nous_feature"):
+                sub_marker = "  ★ Included with your Nous subscription"
+            provider_choices.append(f"{p['name']}{badge}{tag}{configured}{sub_marker}")
 
         # Add skip option
         provider_choices.append("Skip — keep defaults / configure later")
@@ -2410,6 +2423,30 @@ def _configure_provider(provider: dict, config: dict):
 
     # Prompt for each required env var
     all_configured = True
+    # If this BYOK provider lives in a category that ALSO has a
+    # Nous-managed sibling, show a single dim hint so users know
+    # they can avoid the key entirely via a Portal subscription.
+    # Suppressed when the user is already authed to Nous.
+    _show_portal_hint = False
+    if env_vars and not managed_feature and not provider.get("requires_nous_auth"):
+        try:
+            _has_managed_sibling = False
+            for _cat_key, _cat in TOOL_CATEGORIES.items():
+                _providers = _cat.get("providers", [])
+                if provider in _providers and any(
+                    sib.get("managed_nous_feature") for sib in _providers
+                ):
+                    _has_managed_sibling = True
+                    break
+            if _has_managed_sibling:
+                _features = get_nous_subscription_features(config)
+                _show_portal_hint = not _features.nous_auth_present
+        except Exception:
+            _show_portal_hint = False
+
+    if _show_portal_hint:
+        _print_info("  Available through Nous Portal subscription.")
+
     for var in env_vars:
         existing = get_env_value(var["key"])
         if existing:

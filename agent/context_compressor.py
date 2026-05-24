@@ -609,6 +609,7 @@ class ContextCompressor(ContextEngine):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
+        self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -897,7 +898,7 @@ class ContextCompressor(ContextEngine):
         into the warning log.
         """
         self._summary_model_fallen_back = True
-        logging.warning(
+        logger.warning(
             "Summary model '%s' %s (%s). "
             "Falling back to main model '%s' for compression.",
             self.summary_model, reason, e, self.model,
@@ -1182,15 +1183,16 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if any(p in _rte_str for p in _no_provider_phrases):
                 self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
                 self._last_summary_error = "no auxiliary LLM provider configured"
-                logging.warning("Context compression: no provider available for "
-                                "summary. Middle turns will be dropped without summary "
-                                "for %d seconds.",
-                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+                logger.warning("Context compression: no provider available for "
+                               "summary. Middle turns will be dropped without summary "
+                               "for %d seconds.",
+                               _SUMMARY_FAILURE_COOLDOWN_SECONDS)
                 return None
             # Not a configuration gap — route through the shared handler.
             return self._handle_summary_error(_rte, turns_to_summarize, focus_topic=focus_topic)
-        except Exception as _e:
-            return self._handle_summary_error(_e, turns_to_summarize, focus_topic=focus_topic)
+        except Exception as e:
+            return self._handle_summary_error(e, turns_to_summarize, focus_topic=focus_topic)
+
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:
