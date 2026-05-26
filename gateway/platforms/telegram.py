@@ -251,7 +251,7 @@ def _render_table_block_for_telegram(table_block: list[str]) -> str:
     first_data_row = _split_markdown_table_row(table_block[2]) if len(table_block) > 2 else []
     has_row_label_col = len(first_data_row) == len(headers) + 1
 
-    rendered_rows: list[str] = []
+    rendered_groups: list[str] = []
     for index, row in enumerate(table_block[2:], start=1):
         cells = _split_markdown_table_row(row)
         if has_row_label_col:
@@ -269,12 +269,24 @@ def _render_table_block_for_telegram(table_block: list[str]) -> str:
         elif len(data_cells) > len(headers):
             data_cells = data_cells[: len(headers)]
 
-        rendered_rows.append(f"**{heading}**")
-        rendered_rows.extend(
-            f"• {header}: {value}" for header, value in zip(headers, data_cells)
-        )
+        # Build the bulleted lines for this row.  Skip any bullet whose value
+        # duplicates the heading text -- when has_row_label_col is False the
+        # heading IS the first data cell, and emitting it twice (once as the
+        # bold heading, once as the first bullet) is visual noise.
+        bullets: list[str] = []
+        for header, value in zip(headers, data_cells):
+            if not has_row_label_col and value == heading:
+                continue
+            bullets.append(f"• {header}: {value}")
 
-    return "\n\n".join(rendered_rows)
+        # Within a row-group: single newline between heading and its bullets,
+        # and between successive bullets.  This keeps the row visually tight
+        # on Telegram instead of stretching each bullet into its own paragraph.
+        group_lines = [f"**{heading}**", *bullets]
+        rendered_groups.append("\n".join(group_lines))
+
+    # Between row-groups: blank line so each group reads as a distinct block.
+    return "\n\n".join(rendered_groups)
 
 
 def _wrap_markdown_tables(text: str) -> str:
@@ -440,6 +452,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # After sustained reconnect storms the PTB httpx pool can return
+        # SendResult(success=True) for sends that never actually transmit.
+        # _handle_polling_network_error sets this; _verify_polling_after_reconnect
+        # clears it once getMe() confirms the Bot client is healthy.
+        # While True, send() short-circuits to a failure so callers
+        # (cron live-adapter branch) fall through to standalone delivery.
+        self._send_path_degraded: bool = False
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
@@ -571,6 +590,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         reply_to = metadata.get("telegram_reply_to_message_id")
         return int(reply_to) if reply_to is not None else None
+
+    @staticmethod
+    def _looks_like_private_chat_id(chat_id: str) -> bool:
+        try:
+            return int(chat_id) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _is_private_dm_topic_send(
+        cls,
+        chat_id: str,
+        thread_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        if cls._metadata_direct_messages_topic_id(metadata) is not None:
+            return False
+        if metadata and metadata.get("telegram_dm_topic_created_for_send"):
+            return False
+        return bool(
+            thread_id
+            and (
+                metadata and metadata.get("telegram_dm_topic_reply_fallback")
+                or cls._looks_like_private_chat_id(chat_id)
+            )
+        )
+
+    @staticmethod
+    def _dm_topic_missing_anchor_error() -> str:
+        return "Telegram DM topic delivery requires a reply anchor; refusing to send outside the requested topic"
 
     @classmethod
     def _reply_to_message_id_for_send(
@@ -885,6 +934,7 @@ class TelegramAdapter(BasePlatformAdapter):
         MAX_DELAY = 60
 
         self._polling_network_error_count += 1
+        self._send_path_degraded = True
         attempt = self._polling_network_error_count
 
         if attempt > MAX_NETWORK_RETRIES:
@@ -982,6 +1032,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+            self._send_path_degraded = False
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -1164,6 +1215,59 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = await self._create_dm_topic(chat_id_int, name=name)
         return str(thread_id) if thread_id else None
 
+    async def ensure_dm_topic(self, chat_id: str, topic_name: str, force_create: bool = False) -> Optional[str]:
+        """Return a private DM topic thread id, creating and persisting it if needed."""
+        name = str(topic_name or "").strip()
+        if not name:
+            return None
+        try:
+            chat_id_int = int(chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        cache_key = f"{chat_id_int}:{name}"
+        cached = self._dm_topics.get(cache_key)
+        if cached and not force_create:
+            return str(cached)
+
+        topic_conf: Optional[Dict[str, Any]] = None
+        chat_entry: Optional[Dict[str, Any]] = None
+        for entry in self._dm_topics_config:
+            if str(entry.get("chat_id")) != str(chat_id_int):
+                continue
+            chat_entry = entry
+            for candidate in entry.get("topics", []):
+                if candidate.get("name") == name:
+                    topic_conf = candidate
+                    break
+            break
+
+        if topic_conf and topic_conf.get("thread_id") and not force_create:
+            thread_id = int(topic_conf["thread_id"])
+            self._dm_topics[cache_key] = thread_id
+            return str(thread_id)
+
+        if chat_entry is None:
+            chat_entry = {"chat_id": chat_id_int, "topics": []}
+            self._dm_topics_config.append(chat_entry)
+        if topic_conf is None:
+            topic_conf = {"name": name}
+            chat_entry.setdefault("topics", []).append(topic_conf)
+
+        thread_id = await self._create_dm_topic(
+            chat_id_int,
+            name=name,
+            icon_color=topic_conf.get("icon_color"),
+            icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"),
+        )
+        if not thread_id:
+            return None
+
+        topic_conf["thread_id"] = thread_id
+        self._dm_topics[cache_key] = int(thread_id)
+        self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
+        return str(thread_id)
+
     async def rename_dm_topic(
         self,
         chat_id: int,
@@ -1187,7 +1291,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self.name, chat_id, thread_id, name,
         )
 
-    def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int) -> None:
+    def _persist_dm_topic_thread_id(
+        self,
+        chat_id: int,
+        topic_name: str,
+        thread_id: int,
+        replace_existing: bool = False,
+    ) -> None:
         """Save a newly created thread_id back into config.yaml so it persists across restarts."""
         try:
             from hermes_constants import get_hermes_home
@@ -1200,25 +1310,44 @@ class TelegramAdapter(BasePlatformAdapter):
             with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
-            # Navigate to platforms.telegram.extra.dm_topics
-            dm_topics = (
-                config.get("platforms", {})
-                .get("telegram", {})
-                .get("extra", {})
-                .get("dm_topics", [])
-            )
-            if not dm_topics:
-                return
+            # Navigate to platforms.telegram.extra.dm_topics, creating the path
+            # when a named delivery target asks us to create a topic that was
+            # not predeclared in config.yaml.
+            platforms = config.setdefault("platforms", {})
+            telegram_config = platforms.setdefault("telegram", {})
+            extra = telegram_config.setdefault("extra", {})
+            dm_topics = extra.setdefault("dm_topics", [])
 
             changed = False
+            matching_chat_entry = None
             for chat_entry in dm_topics:
-                if int(chat_entry.get("chat_id", 0)) != int(chat_id):
+                try:
+                    chat_matches = int(chat_entry.get("chat_id", 0)) == int(chat_id)
+                except (TypeError, ValueError):
+                    chat_matches = False
+                if not chat_matches:
                     continue
-                for t in chat_entry.get("topics", []):
-                    if t.get("name") == topic_name and not t.get("thread_id"):
-                        t["thread_id"] = thread_id
-                        changed = True
+                matching_chat_entry = chat_entry
+                for t in chat_entry.setdefault("topics", []):
+                    if t.get("name") == topic_name:
+                        if replace_existing or not t.get("thread_id"):
+                            if t.get("thread_id") != thread_id:
+                                t["thread_id"] = thread_id
+                                changed = True
                         break
+                else:
+                    chat_entry.setdefault("topics", []).append(
+                        {"name": topic_name, "thread_id": thread_id}
+                    )
+                    changed = True
+                break
+
+            if matching_chat_entry is None:
+                dm_topics.append({
+                    "chat_id": chat_id,
+                    "topics": [{"name": topic_name, "thread_id": thread_id}],
+                })
+                changed = True
 
             if changed:
                 fd, tmp_path = tempfile.mkstemp(
@@ -1694,7 +1823,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        if getattr(self, "_send_path_degraded", False):
+            return SendResult(success=False, error="send_path_degraded", retryable=True)
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -1737,11 +1870,21 @@ class TelegramAdapter(BasePlatformAdapter):
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
-                reply_to_source = reply_to or (
-                    str(metadata_reply_to)
-                    if metadata and metadata.get("telegram_dm_topic_reply_fallback") and metadata_reply_to is not None else None
+                private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
+                # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
+                # is an explicit user opt-in to "message_thread_id alone is enough" (PR #23994
+                # / commit 21a15b671). Honor it — don't fail loud just because the anchor was
+                # suppressed by config. The new fail-loud contract only applies when the caller
+                # didn't ask for the anchor to be dropped.
+                dm_topic_reply_to_off = (
+                    private_dm_topic_send
+                    and self._reply_to_mode == "off"
+                    and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
-                if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+                reply_to_source = reply_to or (
+                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
+                )
+                if private_dm_topic_send:
                     should_thread = (
                         reply_to_source is not None
                         and self._reply_to_mode != "off"
@@ -1749,6 +1892,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     should_thread = self._should_thread_reply(reply_to_source, i)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+                if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+                    return SendResult(
+                        success=False,
+                        error=self._dm_topic_missing_anchor_error(),
+                        retryable=False,
+                    )
                 thread_kwargs = self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -1799,6 +1948,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
+                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
                                 # Telegram has been observed to return a
                                 # one-off "thread not found" that recovers on
                                 # an immediate retry (transient flake — see
@@ -1825,6 +1980,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
+                                if private_dm_topic_send:
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
                                 # Original message was deleted before we
                                 # could reply. For private-topic fallback
                                 # sends, message_thread_id is only valid with
