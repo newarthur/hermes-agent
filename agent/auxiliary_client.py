@@ -3739,6 +3739,39 @@ def resolve_provider_client(
             return resolve_provider_client("openai-codex", model, async_mode)
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
+        if provider == "google-gemini-cli":
+            try:
+                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+            except ImportError:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli requested but "
+                    "Gemini Cloud Code adapter is unavailable"
+                )
+                return None, None
+            creds = resolve_gemini_oauth_runtime_credentials()
+            api_key = str(creds.get("api_key", "")).strip() or "google-oauth"
+            base_url = str(creds.get("base_url", "")).strip() or "cloudcode-pa://google"
+            project_id = str(creds.get("project_id", "")).strip()
+            final_model = (
+                _normalize_resolved_model(
+                    model
+                    or (main_runtime.get("model") if main_runtime else None)
+                    or _read_main_model()
+                    or _get_aux_model_for_provider(provider)
+                    or "gemini-3-flash-preview",
+                    provider,
+                )
+                or "gemini-3-flash-preview"
+            )
+            client = GeminiCloudCodeClient(
+                api_key=api_key,
+                base_url=base_url,
+                project_id=project_id,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
