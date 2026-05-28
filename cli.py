@@ -562,13 +562,12 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -2832,42 +2831,6 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     return parsed
 
 
-def _load_persona_model_routes_from_config(config: dict | None = None) -> dict:
-    """Return persona model routes from agent.persona_model_routes or legacy top-level key."""
-    cfg = config if config is not None else CLI_CONFIG
-    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
-    routes = agent_cfg.get("persona_model_routes")
-    if not isinstance(routes, dict) or not routes:
-        routes = cfg.get("persona_model_routes")
-    return routes if isinstance(routes, dict) else {}
-
-
-def _normalize_persona_fallback(entry) -> list:
-    if isinstance(entry, dict):
-        provider = str(entry.get("provider") or "").strip()
-        model = str(entry.get("model") or "").strip()
-        return [entry] if provider and model else []
-    if isinstance(entry, list):
-        return [e for e in entry if isinstance(e, dict) and str(e.get("provider") or "").strip() and str(e.get("model") or "").strip()]
-    return []
-
-
-def _format_cli_persona_route_lines(personality: str, config: dict | None = None) -> list[str]:
-    route = _load_persona_model_routes_from_config(config).get(personality)
-    if not isinstance(route, dict):
-        return []
-    lines = []
-    provider = str(route.get("provider") or "").strip()
-    model = str(route.get("model") or "").strip()
-    if provider or model:
-        lines.append(f"  Primary: {provider or '(current provider)'} / {model or '(current model)'}")
-    fallback = _normalize_persona_fallback(route.get("fallback_model"))
-    if fallback:
-        fb = fallback[0]
-        lines.append(f"  Fallback: {fb.get('provider')} / {fb.get('model')}")
-    return lines
-
-
 def save_config_value(key_path: str, value: any) -> bool:
     """
     Save a value to the active config file at the specified key path.
@@ -3176,25 +3139,6 @@ class HermesCLI:
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
-
-        # Apply the active persona route at startup.  Accept the documented
-        # agent.persona_model_routes and this install's legacy top-level key.
-        _display_cfg = CLI_CONFIG.get("display") if isinstance(CLI_CONFIG.get("display"), dict) else {}
-        _active_persona = str(_display_cfg.get("personality") or "").strip().lower()
-        if _active_persona not in ("", "none", "default", "neutral"):
-            _route = _load_persona_model_routes_from_config(CLI_CONFIG).get(_active_persona)
-            if isinstance(_route, dict):
-                _route_provider = str(_route.get("provider") or "").strip()
-                _route_model = str(_route.get("model") or "").strip()
-                if _route_provider and not provider:
-                    self.requested_provider = _route_provider
-                    self.provider = _route_provider
-                if _route_model and not model:
-                    self.model = _route_model
-                    self._model_is_default = False
-                _route_fb = _normalize_persona_fallback(_route.get("fallback_model"))
-                if _route_fb:
-                    self._fallback_model = _route_fb
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -7210,11 +7154,13 @@ class HermesCLI:
 
         * ``sys.platform == "win32"`` — native Windows console (ConPTY /
           win32_input) does not support the modal reliably.
-        * Called from a non-main thread — the prompt_toolkit event loop only
-          runs on the main thread; key bindings can't fire from a daemon
-          thread (same rationale as the ``_prompt_text_input`` thread guard
-          in PR #23454).
         * ``self._app`` is not set — unit tests / non-interactive contexts.
+
+        On non-Windows platforms the modal itself is still safe from the
+        ``process_loop`` daemon thread as long as the main-thread event loop
+        owns the prompt_toolkit buffer mutations.  When we are off the main
+        thread, schedule the modal snapshot / restore work on ``self._app.loop``
+        via ``call_soon_threadsafe`` and keep the queue-based response path.
         """
         import threading
         import time as _time
@@ -7235,33 +7181,62 @@ class HermesCLI:
         if sys.platform == "win32":
             return self._prompt_text_input("Choice [1/2/3]: ")
 
-        # Mirror the thread-aware guard from _prompt_text_input (PR #23454):
-        # run_in_terminal and the modal queue both depend on the main-thread
-        # event loop.  From a daemon thread the modal key bindings never fire.
-        if threading.current_thread() is not threading.main_thread():
+        try:
+            app_loop = self._app.loop
+        except Exception:
+            app_loop = None
+
+        in_main_thread = threading.current_thread() is threading.main_thread()
+        if not in_main_thread and app_loop is None:
             return self._prompt_text_input("Choice [1/2/3]: ")
 
         response_queue = queue.Queue()
-        self._capture_modal_input_snapshot()
-        self._slash_confirm_state = {
-            "title": title,
-            "detail": detail,
-            "choices": choices,
-            "selected": 0,
-            "response_queue": response_queue,
-        }
-        self._slash_confirm_deadline = _time.monotonic() + timeout
-        self._invalidate()
+
+        def _setup_modal() -> None:
+            self._capture_modal_input_snapshot()
+            self._slash_confirm_state = {
+                "title": title,
+                "detail": detail,
+                "choices": choices,
+                "selected": 0,
+                "response_queue": response_queue,
+            }
+            self._slash_confirm_deadline = _time.monotonic() + timeout
+            self._invalidate()
+
+        def _teardown_modal() -> None:
+            self._slash_confirm_state = None
+            self._slash_confirm_deadline = 0
+            self._restore_modal_input_snapshot()
+            self._invalidate()
+
+        def _run_on_app_loop(fn) -> bool:
+            if in_main_thread or app_loop is None:
+                fn()
+                return True
+            ready = threading.Event()
+
+            def _wrapped() -> None:
+                try:
+                    fn()
+                finally:
+                    ready.set()
+
+            try:
+                app_loop.call_soon_threadsafe(_wrapped)
+            except Exception:
+                return False
+            return ready.wait(timeout=5)
+
+        if not _run_on_app_loop(_setup_modal):
+            return self._prompt_text_input("Choice [1/2/3]: ")
 
         _last_countdown_refresh = _time.monotonic()
         try:
             while True:
                 try:
                     result = response_queue.get(timeout=1)
-                    self._slash_confirm_state = None
-                    self._slash_confirm_deadline = 0
-                    self._restore_modal_input_snapshot()
-                    self._invalidate()
+                    _run_on_app_loop(_teardown_modal)
                     return result
                 except queue.Empty:
                     remaining = self._slash_confirm_deadline - _time.monotonic()
@@ -7273,10 +7248,7 @@ class HermesCLI:
                         self._invalidate()
         finally:
             if self._slash_confirm_state is not None:
-                self._slash_confirm_state = None
-                self._slash_confirm_deadline = 0
-                self._restore_modal_input_snapshot()
-                self._invalidate()
+                _run_on_app_loop(_teardown_modal)
         return None
 
     def _submit_slash_confirm_response(self, value: str | None) -> None:
@@ -7926,7 +7898,6 @@ class HermesCLI:
             if personality_name in {"none", "default", "neutral"}:
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
-                save_config_value("display.personality", "none")
                 if save_config_value("agent.system_prompt", ""):
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
@@ -7934,30 +7905,12 @@ class HermesCLI:
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
-                _route = _load_persona_model_routes_from_config(CLI_CONFIG).get(personality_name)
-                if isinstance(_route, dict):
-                    _route_provider = str(_route.get("provider") or "").strip()
-                    _route_model = str(_route.get("model") or "").strip()
-                    if _route_provider:
-                        self.provider = _route_provider
-                        self.requested_provider = _route_provider
-                        save_config_value("model.provider", _route_provider)
-                    if _route_model:
-                        self.model = _route_model
-                        self._model_is_default = False
-                        save_config_value("model.default", _route_model)
-                    _route_fb = _normalize_persona_fallback(_route.get("fallback_model"))
-                    if _route_fb:
-                        self._fallback_model = _route_fb
                 self.agent = None  # Force re-init
-                save_config_value("display.personality", personality_name)
                 if save_config_value("agent.system_prompt", self.system_prompt):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
-                for _line in _format_cli_persona_route_lines(personality_name, CLI_CONFIG):
-                    print(_line)
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")
@@ -10714,7 +10667,8 @@ class HermesCLI:
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: pip install faster-whisper  (free, local)\n"
+                "Option 1: uv pip install faster-whisper  "
+                "(free, local; `pip install faster-whisper` also works if pip is on PATH)\n"
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )

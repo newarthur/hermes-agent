@@ -693,16 +693,6 @@ def build_anthropic_client(
     from httpx import Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
-    if normalized_base_url:
-        # Kimi exposes two different Coding surfaces:
-        #   https://api.kimi.com/coding     -> Anthropic Messages API
-        #   https://api.kimi.com/coding/v1  -> OpenAI-compatible API
-        # Hermes may store /coding/v1 because that endpoint supports /models
-        # health checks, but the Anthropic SDK appends /v1/messages itself.
-        # Passing /coding/v1 to the SDK therefore produces
-        # /coding/v1/v1/messages and Kimi returns HTTP 404.
-        if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
-            normalized_base_url = "https://api.kimi.com/coding"
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     kwargs = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),
@@ -1641,11 +1631,7 @@ def _content_parts_to_anthropic_blocks(parts: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _convert_assistant_message(
-    m: Dict[str, Any],
-    base_url: str | None = None,
-    model: str | None = None,
-) -> Dict[str, Any]:
+def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
     """Convert an assistant message to Anthropic content blocks.
 
     Handles thinking blocks, regular content, tool calls, and
@@ -1693,10 +1679,7 @@ def _convert_assistant_message(
     # signed thinking blocks — adding another unsigned one from
     # reasoning_content would create a duplicate (same text) that gets
     # downgraded to a spurious text block on the last assistant message.
-    reasoning_content = m.get("reasoning_content") or m.get("reasoning")
-    if _is_kimi_family_endpoint(base_url, model) and m.get("tool_calls"):
-        if reasoning_content is None:
-            reasoning_content = ""
+    reasoning_content = m.get("reasoning_content")
     _already_has_thinking = any(
         isinstance(b, dict) and b.get("type") in {"thinking", "redacted_thinking"}
         for b in blocks
@@ -2049,7 +2032,7 @@ def convert_messages_to_anthropic(
             continue
 
         if role == "assistant":
-            result.append(_convert_assistant_message(m, base_url=base_url, model=model))
+            result.append(_convert_assistant_message(m))
             continue
 
         if role == "tool":

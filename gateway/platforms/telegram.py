@@ -51,19 +51,8 @@ except ImportError:
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
-    class _MockParseMode:
-        MARKDOWN_V2 = "MarkdownV2"
-        MARKDOWN = "Markdown"
-        HTML = "HTML"
-
-    class _MockChatType:
-        GROUP = "group"
-        SUPERGROUP = "supergroup"
-        CHANNEL = "channel"
-        PRIVATE = "private"
-
-    ParseMode = _MockParseMode
-    ChatType = _MockChatType
+    ParseMode = None
+    ChatType = None
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.
@@ -2816,18 +2805,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         try:
-            # If there's an existing picker message for this chat, delete it first
-            # so we don't accumulate stale inline-keyboard messages.
-            old_state = self._model_picker_state.pop(str(chat_id), None)
-            if old_state and old_state.get("msg_id"):
-                try:
-                    await self._bot.delete_message(
-                        chat_id=int(chat_id),
-                        message_id=old_state["msg_id"],
-                    )
-                except Exception:
-                    pass  # Message may already be deleted or too old
-
             # Build provider buttons — 2 per row
             buttons: list = []
             for p in providers:
@@ -5671,24 +5648,15 @@ class TelegramAdapter(BasePlatformAdapter):
         chat = message.chat
         user = message.from_user
         
-        # Determine chat type. Prefer direct comparison against the imported
-        # ChatType constants before falling back to string normalization. Some
-        # tests replace the telegram module with MagicMock-based stubs before
-        # this module is imported; in that case ``str(ChatType.SUPERGROUP)`` is
-        # a MagicMock repr, not ``"supergroup"``, but equality with the cached
-        # constant still identifies the chat type.
-        raw_chat_type = getattr(chat, "type", "")
+        # Determine chat type.  Normalize through ``str`` so tests/mocks and
+        # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
+        # string-like, but mocks often provide plain strings).
+        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
         chat_type = "dm"
-        if raw_chat_type in (getattr(ChatType, "GROUP", None), getattr(ChatType, "SUPERGROUP", None)):
+        if telegram_chat_type in {"group", "supergroup"}:
             chat_type = "group"
-        elif raw_chat_type == getattr(ChatType, "CHANNEL", None):
+        elif telegram_chat_type == "channel":
             chat_type = "channel"
-        else:
-            telegram_chat_type = str(raw_chat_type).split(".")[-1].lower()
-            if telegram_chat_type in {"group", "supergroup"}:
-                chat_type = "group"
-            elif telegram_chat_type == "channel":
-                chat_type = "channel"
 
         # Resolve Telegram topic name and skill binding.
         # Only preserve message_thread_id when Telegram marks the message as
