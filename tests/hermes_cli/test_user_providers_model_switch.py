@@ -14,6 +14,36 @@ from hermes_cli import runtime_provider as rp
 # Tests for list_authenticated_providers including full models list
 # =============================================================================
 
+
+def test_list_authenticated_providers_collapses_kimi_alias_env_to_canonical(monkeypatch):
+    """KIMI_API_KEY must not create both `kimi` and `kimi-coding` picker rows.
+
+    The TUI gateway loads .env before building model.options.  With KIMI_API_KEY
+    present, the models.dev alias loop used to emit slug `kimi`, while the
+    canonical overlay emitted `kimi-coding`, producing two Kimi buttons for the
+    same backend.
+    """
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-test")
+    monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", lambda _provider: [])
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda: {"kimi-for-coding": {"name": "Kimi For Coding"}},
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openai-codex",
+        user_providers={},
+        custom_providers=[],
+        max_models=50,
+    )
+
+    kimi_rows = [
+        p for p in providers
+        if "kimi" in p["slug"].lower() or "kimi" in p.get("name", "").lower()
+    ]
+    assert [p["slug"] for p in kimi_rows] == ["kimi-coding"]
+
+
 def test_list_authenticated_providers_includes_full_models_list_from_user_providers(monkeypatch):
     """User-defined providers should expose both default_model and full models list.
     

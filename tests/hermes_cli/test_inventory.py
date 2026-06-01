@@ -215,6 +215,23 @@ def test_include_unconfigured_skips_already_present_slugs():
     assert or_rows[0]["models"] == ["m1"]  # the authenticated row, not skeleton
 
 
+def test_include_unconfigured_skips_aliases_for_authenticated_models_dev_provider():
+    """An authenticated Kimi Coding row must suppress Kimi CN skeleton aliases."""
+    rows = [
+        {"slug": "kimi-coding", "name": "Kimi For Coding", "models": ["kimi-k2.6"],
+         "total_models": 1, "is_current": False, "is_user_defined": False,
+         "source": "built-in"},
+    ]
+    ctx = _empty_ctx()
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx, include_unconfigured=True)
+    kimi_slugs = [
+        r["slug"] for r in payload["providers"]
+        if "kimi" in r["slug"].lower() or "moonshot" in r.get("name", "").lower()
+    ]
+    assert kimi_slugs == ["kimi-coding"]
+
+
 # ─── picker_hints ──────────────────────────────────────────────────────
 
 

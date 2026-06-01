@@ -1206,10 +1206,29 @@ def list_authenticated_providers(
         if not isinstance(pdata, dict):
             continue
 
+        # Collapse legacy aliases (``kimi`` / ``moonshot``) onto Hermes's
+        # canonical provider slug before credential checks and before adding
+        # the row.  Otherwise a process that has ``KIMI_API_KEY`` loaded can
+        # emit both ``kimi`` (models.dev alias) and ``kimi-coding``
+        # (canonical/auth-store row), producing duplicate Telegram/TUI picker
+        # buttons for the same Kimi Coding backend.
+        canonical_hermes_id = hermes_id
+        try:
+            from hermes_cli.auth import resolve_provider as _resolve_auth_provider
+
+            resolved = _resolve_auth_provider(hermes_id)
+            if resolved in PROVIDER_REGISTRY:
+                canonical_hermes_id = resolved
+        except Exception:
+            canonical_hermes_id = hermes_id
+
+        if canonical_hermes_id.lower() in seen_slugs:
+            continue
+
         # Prefer auth.py PROVIDER_REGISTRY for env var names — it's our
         # source of truth.  models.dev can have wrong mappings (e.g.
         # minimax-cn → MINIMAX_API_KEY instead of MINIMAX_CN_API_KEY).
-        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        pconfig = PROVIDER_REGISTRY.get(canonical_hermes_id) or PROVIDER_REGISTRY.get(hermes_id)
         # Skip non-API-key auth providers here — they are handled in
         # section 2 (HERMES_OVERLAYS) with proper auth store checking.
         if pconfig and pconfig.auth_type != "api_key":
@@ -1227,7 +1246,10 @@ def list_authenticated_providers(
             try:
                 from hermes_cli.auth import _load_auth_store
                 store = _load_auth_store()
-                if store and store.get("credential_pool", {}).get(hermes_id):
+                if store and (
+                    store.get("credential_pool", {}).get(canonical_hermes_id)
+                    or store.get("credential_pool", {}).get(hermes_id)
+                ):
                     has_creds = True
             except Exception:
                 pass
@@ -1238,17 +1260,17 @@ def list_authenticated_providers(
         # /model picker sees the SAME list `hermes model` would build, with
         # disk caching to keep the picker open snappy. Falls back to the
         # curated static list when the live fetcher returns nothing.
-        model_ids = cached_provider_model_ids(hermes_id)
+        model_ids = cached_provider_model_ids(canonical_hermes_id)
         if not model_ids:
-            model_ids = curated.get(hermes_id, [])
-            if hermes_id in _MODELS_DEV_PREFERRED:
-                model_ids = _merge_with_models_dev(hermes_id, model_ids)
+            model_ids = curated.get(canonical_hermes_id, []) or curated.get(hermes_id, [])
+            if canonical_hermes_id in _MODELS_DEV_PREFERRED:
+                model_ids = _merge_with_models_dev(canonical_hermes_id, model_ids)
         total = len(model_ids)
         top = model_ids[:max_models]
 
-        slug = hermes_id
+        slug = canonical_hermes_id
         pinfo = _mdev_pinfo(mdev_id)
-        display_name = pinfo.name if pinfo else mdev_id
+        display_name = get_label(slug) if slug != hermes_id else (pinfo.name if pinfo else mdev_id)
 
         results.append({
             "slug": slug,
@@ -1260,6 +1282,8 @@ def list_authenticated_providers(
             "source": "built-in",
         })
         seen_slugs.add(slug.lower())
+        seen_slugs.add(hermes_id.lower())
+        seen_slugs.add(normalize_provider(hermes_id).lower())
         seen_mdev_ids.add(mdev_id)
         _record_builtin_endpoint(slug)
 

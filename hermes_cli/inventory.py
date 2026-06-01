@@ -160,12 +160,26 @@ def build_models_payload(
 def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict]:
     """Build skeleton rows for canonical providers missing from ``rows``."""
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+    from agent.models_dev import PROVIDER_TO_MODELS_DEV
 
     seen = {r["slug"].lower() for r in rows}
+    seen_mdev_ids = {
+        PROVIDER_TO_MODELS_DEV.get(r["slug"])
+        for r in rows
+        if PROVIDER_TO_MODELS_DEV.get(r["slug"])
+    }
     cur = (ctx.current_provider or "").lower()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
+            continue
+        # Hide unconfigured canonical aliases that point at the same upstream
+        # models.dev provider as an already-authenticated row.  This prevents
+        # duplicate Kimi buttons such as ``Kimi For Coding`` +
+        # ``Kimi / Kimi Coding Plan``/``Kimi CN`` when only the canonical
+        # ``kimi-coding`` provider should be visible.
+        mdev_id = PROVIDER_TO_MODELS_DEV.get(entry.slug)
+        if mdev_id and mdev_id in seen_mdev_ids:
             continue
         extras.append(
             {
