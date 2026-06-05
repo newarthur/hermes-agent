@@ -284,26 +284,30 @@ def test_openai_native_curated_catalog_is_non_empty():
     assert len(_PROVIDER_MODELS["openai"]) >= 4
 
 
-def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch):
+def test_list_authenticated_providers_openai_codex_built_in_nonzero_total(monkeypatch):
     """Built-in openai-codex row must not report total_models=0 when creds exist."""
-    # openai-codex uses OAuth (not API key), so we mock HERMES_OVERLAYS
-    # and the credential pool to simulate an authenticated state.
+    # openai-codex uses OAuth (not API key), so mock the overlay,
+    # credential pool, and model discovery to simulate an authenticated state.
     from hermes_cli.providers import HermesOverlay
+
     monkeypatch.setattr(
         "agent.models_dev.fetch_models_dev",
         lambda: {"openai": {"env": []}},
     )
     monkeypatch.setattr(
         "hermes_cli.providers.HERMES_OVERLAYS",
-        {"openai": HermesOverlay(
+        {"openai-codex": HermesOverlay(
             auth_type="oauth_external",
-            extra_env_vars=[],
+            extra_env_vars=(),
         )},
     )
-    # Mock credential pool to report credentials exist
     monkeypatch.setattr(
         "agent.credential_pool.load_pool",
         lambda provider: type("MockPool", (), {"has_credentials": lambda self: True})(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.cached_provider_model_ids",
+        lambda provider: ["gpt-5.5"] if provider == "openai-codex" else [],
     )
 
     providers = list_authenticated_providers(
@@ -316,6 +320,87 @@ def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch)
     row = next((p for p in providers if p.get("slug") == "openai-codex"), None)
     assert row is not None, f"openai-codex not found in providers: {[p.get('slug') for p in providers]}"
     assert row["total_models"] > 0
+
+
+def test_list_authenticated_providers_openai_alias_not_emitted_as_phantom(monkeypatch):
+    """Bare 'openai' is an alias to the OpenRouter aggregator, NOT a directly-
+    routable provider. It must NOT be emitted as its own picker row: selecting
+    such a row resolves via resolve_provider_full() to OpenRouter, silently
+    switching the user onto an endpoint they may have no key for (HTTP 401).
+    Real OpenAI access comes via 'openai-api' (direct) or a providers.openai
+    config entry — both of which carry api.openai.com. See model-picker bug."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda: {"openai": {"env": ["OPENAI_API_KEY"]}},
+    )
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        max_models=50,
+    )
+    row = next((p for p in providers if p.get("slug") == "openai"), None)
+    assert row is None, (
+        "bare 'openai' alias must not appear as a standalone picker row — "
+        "it routes through OpenRouter and traps users without an OR key"
+    )
+
+
+def test_resolve_provider_full_user_config_openai_beats_alias():
+    """A providers.openai config entry must win over the built-in
+    'openai' → 'openrouter' alias. Regression for the model-picker bug
+    where users with provider=openai-api + a providers.openai config block
+    had their OpenAI selection silently routed to OpenRouter (HTTP 401)."""
+    from hermes_cli.providers import resolve_provider_full
+
+    user_providers = {
+        "openai": {
+            "name": "OpenAI-API",
+            "api": "https://api.openai.com/v1",
+            "transport": "codex_responses",
+            "models": {"gpt-5.4-nano": {}},
+        }
+    }
+    pdef = resolve_provider_full("openai", user_providers, [])
+    assert pdef is not None
+    # Must resolve to the user's direct endpoint, NOT the OpenRouter aggregator.
+    assert pdef.id == "openai"
+    assert pdef.source == "user-config"
+    assert pdef.base_url == "https://api.openai.com/v1"
+    assert "openrouter" not in pdef.base_url
+
+
+def test_switch_model_user_config_openai_does_not_hop_to_openrouter(monkeypatch):
+    """End-to-end: selecting a providers.openai config row in the picker must
+    resolve to api.openai.com, never silently switch to OpenRouter."""
+    monkeypatch.setenv("CUSTOM_OPENAI_API_KEY", "sk-resolved")
+    user_providers = {
+        "openai": {
+            "name": "OpenAI-API",
+            "api": "https://api.openai.com/v1",
+            "api_key": "${CUSTOM_OPENAI_API_KEY}",
+            "transport": "codex_responses",
+            "models": {"gpt-5.4-nano": {}, "gpt-4o-mini": {}},
+        }
+    }
+    result = switch_model(
+        raw_input="gpt-4o-mini",
+        current_provider="openai-api",
+        current_model="gpt-5.4-nano",
+        current_base_url="https://api.openai.com/v1",
+        current_api_key="sk-test",
+        explicit_provider="openai",
+        user_providers=user_providers,
+        custom_providers=[],
+    )
+    assert result.success, result.error_message
+    assert result.target_provider != "openrouter"
+    assert "openrouter" not in (result.base_url or "")
+    assert result.base_url == "https://api.openai.com/v1"
 
 
 def test_list_authenticated_providers_user_openai_official_url_fallback(monkeypatch):
