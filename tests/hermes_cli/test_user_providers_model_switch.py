@@ -306,7 +306,7 @@ def test_list_authenticated_providers_openai_codex_built_in_nonzero_total(monkey
         lambda provider: type("MockPool", (), {"has_credentials": lambda self: True})(),
     )
     monkeypatch.setattr(
-        "hermes_cli.model_switch.cached_provider_model_ids",
+        "hermes_cli.models.cached_provider_model_ids",
         lambda provider: ["gpt-5.5"] if provider == "openai-codex" else [],
     )
 
