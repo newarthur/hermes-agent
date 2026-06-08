@@ -9,7 +9,7 @@
  * No throw / try-catch here: acquisition failure surfaces as a typed
  * `RendererError` via `Effect.tryPromise`'s `catch`.
  */
-import { createCliRenderer, type CliRenderer } from '@opentui/core'
+import { createCliRenderer, type CliRenderer, type KeyEvent } from '@opentui/core'
 import { Deferred, Effect } from 'effect'
 
 import { RendererError } from './errors.ts'
@@ -45,6 +45,15 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
   const shutdown = yield* Deferred.make<void>()
   renderer.once('destroy', () => {
     Deferred.doneUnsafe(shutdown, Effect.void)
+  })
+
+  // Minimal global quit (Phase 1). `exitOnCtrlC:false` hands Ctrl+C to us as a key
+  // event (not SIGINT), so destroying here fires 'destroy' → resolves `shutdown` →
+  // the entry scope closes → finalizers run: renderer teardown + the gateway layer's
+  // `client.stop()` EOFs the Python child's stdin so it exits (no orphan). Prompts
+  // gate this on `!blocked` once they own Ctrl+C (Phase 3, gotcha §8 #6).
+  renderer.keyInput.on('keypress', (key: KeyEvent) => {
+    if (key.ctrl && key.name === 'c' && !renderer.isDestroyed) renderer.destroy()
   })
 
   return { renderer, shutdown } as const

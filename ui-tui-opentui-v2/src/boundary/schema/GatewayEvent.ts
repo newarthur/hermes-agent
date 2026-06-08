@@ -1,16 +1,237 @@
 /**
- * GatewayEvent — the decoded wire union pushed from the boundary into the Solid store.
+ * GatewayEvent — the wire event union, modeled as an Effect Schema and decoded
+ * ONCE at the transport boundary (spec v4 §3.3). Mirrors Ink's
+ * `ui-tui/src/gatewayTypes.ts:509-587` (discriminant = `type`).
  *
- * Phase 0: a MINIMAL hand-typed placeholder covering only what the "hello" smoke
- * needs (`gateway.ready`, `message.start/delta/complete`). Phase 1 replaces this
- * with the full ~40-member union modeled as `Schema.Class` members +
- * `Schema.toTaggedUnion("type")`, decoded from unknown wire JSON ONCE at the
- * transport boundary (spec v4 §3.3). The discriminant is always `type`, matching
- * Ink's `ui-tui/src/gatewayTypes.ts:509-587`.
+ * beta.78 API (verified vs .d.ts): variants are `Schema.Struct` with a
+ * `Schema.Literal` `type`, combined with `Schema.Union([...]).pipe(
+ * Schema.toTaggedUnion("type"))`. Optional fields use `Schema.optionalKey`
+ * (exact-optional under exactOptionalPropertyTypes). Decode unknown wire JSON
+ * with `Schema.decodeUnknownOption` so an UNRECOGNIZED `type` yields `Option.none`
+ * and is skipped — a stray event never tears down the stream.
+ *
+ * Types are INFERRED from the schema (`typeof X["Type"]`), never hand-declared.
  */
+import { Schema } from 'effect'
 
-export type GatewayEvent =
-  | { readonly type: 'gateway.ready'; readonly session_id?: string }
-  | { readonly type: 'message.start'; readonly session_id?: string }
-  | { readonly type: 'message.delta'; readonly payload?: { readonly text?: string }; readonly session_id?: string }
-  | { readonly type: 'message.complete'; readonly payload?: { readonly text?: string }; readonly session_id?: string }
+const Str = Schema.String
+const opt = Schema.optionalKey
+
+// ── Skin (mirror GatewaySkin in ui-tui/src/gatewayTypes.ts) ───────────
+export const GatewaySkinSchema = Schema.Struct({
+  banner_hero: opt(Str),
+  banner_logo: opt(Str),
+  branding: opt(Schema.Record(Str, Str)),
+  colors: opt(Schema.Record(Str, Str)),
+  help_header: opt(Str),
+  tool_prefix: opt(Str)
+})
+export type GatewaySkinDecoded = typeof GatewaySkinSchema.Type
+
+// ── Variant schemas (one per wire `type`) ─────────────────────────────
+// lifecycle
+const GatewayReady = Schema.Struct({
+  type: Schema.Literal('gateway.ready'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ skin: opt(GatewaySkinSchema) }))
+})
+const SkinChanged = Schema.Struct({
+  type: Schema.Literal('skin.changed'),
+  session_id: opt(Str),
+  payload: opt(GatewaySkinSchema)
+})
+const SessionInfoEvent = Schema.Struct({
+  type: Schema.Literal('session.info'),
+  session_id: opt(Str),
+  // SessionInfo is large + evolving; keep it loose at the boundary (Record),
+  // the chrome phase narrows the fields it actually reads.
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+
+// streaming text
+const MessageStart = Schema.Struct({ type: Schema.Literal('message.start'), session_id: opt(Str) })
+const MessageDelta = Schema.Struct({
+  type: Schema.Literal('message.delta'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str) }))
+})
+const MessageComplete = Schema.Struct({
+  type: Schema.Literal('message.complete'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str) }))
+})
+
+// reasoning / thinking — toTaggedUnion needs ONE literal per member, so the
+// reasoning.delta/reasoning.available pair is two structs sharing a shape.
+const ReasoningShape = {
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ text: opt(Str), verbose: opt(Schema.Boolean) }))
+}
+const ReasoningDelta = Schema.Struct({ type: Schema.Literal('reasoning.delta'), ...ReasoningShape })
+const ReasoningAvailable = Schema.Struct({ type: Schema.Literal('reasoning.available'), ...ReasoningShape })
+const ThinkingDelta = Schema.Struct({
+  type: Schema.Literal('thinking.delta'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ text: opt(Str) }))
+})
+
+// tools
+const ToolStart = Schema.Struct({
+  type: Schema.Literal('tool.start'),
+  session_id: opt(Str),
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+const ToolComplete = Schema.Struct({
+  type: Schema.Literal('tool.complete'),
+  session_id: opt(Str),
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+const ToolProgress = Schema.Struct({
+  type: Schema.Literal('tool.progress'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ name: opt(Str), preview: opt(Str) })
+})
+const ToolGenerating = Schema.Struct({
+  type: Schema.Literal('tool.generating'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ name: opt(Str) })
+})
+
+// blocking prompts (deadlock-critical — Phase 3 renders these)
+const ClarifyRequest = Schema.Struct({
+  type: Schema.Literal('clarify.request'),
+  session_id: opt(Str),
+  payload: Schema.Struct({
+    choices: opt(Schema.NullOr(Schema.Array(Str))),
+    question: opt(Str),
+    request_id: Str
+  })
+})
+const ApprovalRequest = Schema.Struct({
+  type: Schema.Literal('approval.request'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ command: Str, description: Str })
+})
+const SudoRequest = Schema.Struct({
+  type: Schema.Literal('sudo.request'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ request_id: Str })
+})
+const SecretRequest = Schema.Struct({
+  type: Schema.Literal('secret.request'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ env_var: Str, prompt: Str, request_id: Str })
+})
+
+// chrome / agent
+const StatusUpdate = Schema.Struct({
+  type: Schema.Literal('status.update'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ kind: opt(Str), text: opt(Str) }))
+})
+const NotificationShow = Schema.Struct({
+  type: Schema.Literal('notification.show'),
+  session_id: opt(Str),
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+const NotificationClear = Schema.Struct({
+  type: Schema.Literal('notification.clear'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ key: opt(Str) }))
+})
+const VoiceStatus = Schema.Struct({
+  type: Schema.Literal('voice.status'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ state: opt(Schema.Literals(['idle', 'listening', 'transcribing'])) }))
+})
+const VoiceTranscript = Schema.Struct({
+  type: Schema.Literal('voice.transcript'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ no_speech_limit: opt(Schema.Boolean), text: opt(Str) }))
+})
+const BrowserProgress = Schema.Struct({
+  type: Schema.Literal('browser.progress'),
+  session_id: opt(Str),
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+const BackgroundComplete = Schema.Struct({
+  type: Schema.Literal('background.complete'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ task_id: Str, text: Str })
+})
+const ReviewSummary = Schema.Struct({
+  type: Schema.Literal('review.summary'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ text: opt(Str) }))
+})
+const SubagentShape = { session_id: opt(Str), payload: Schema.Record(Str, Schema.Unknown) }
+const SubagentSpawnRequested = Schema.Struct({ type: Schema.Literal('subagent.spawn_requested'), ...SubagentShape })
+const SubagentStart = Schema.Struct({ type: Schema.Literal('subagent.start'), ...SubagentShape })
+const SubagentThinking = Schema.Struct({ type: Schema.Literal('subagent.thinking'), ...SubagentShape })
+const SubagentTool = Schema.Struct({ type: Schema.Literal('subagent.tool'), ...SubagentShape })
+const SubagentProgress = Schema.Struct({ type: Schema.Literal('subagent.progress'), ...SubagentShape })
+const SubagentComplete = Schema.Struct({ type: Schema.Literal('subagent.complete'), ...SubagentShape })
+
+// transport errors
+const ErrorEvent = Schema.Struct({
+  type: Schema.Literal('error'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ message: opt(Str) }))
+})
+const GatewayStderr = Schema.Struct({
+  type: Schema.Literal('gateway.stderr'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ line: Str })
+})
+const GatewayStartTimeout = Schema.Struct({
+  type: Schema.Literal('gateway.start_timeout'),
+  session_id: opt(Str),
+  payload: Schema.Record(Str, Schema.Unknown)
+})
+const GatewayProtocolError = Schema.Struct({
+  type: Schema.Literal('gateway.protocol_error'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ preview: opt(Str) }))
+})
+
+// ── The union ─────────────────────────────────────────────────────────
+export const GatewayEventSchema = Schema.Union([
+  GatewayReady,
+  SkinChanged,
+  SessionInfoEvent,
+  MessageStart,
+  MessageDelta,
+  MessageComplete,
+  ReasoningDelta,
+  ReasoningAvailable,
+  ThinkingDelta,
+  ToolStart,
+  ToolComplete,
+  ToolProgress,
+  ToolGenerating,
+  ClarifyRequest,
+  ApprovalRequest,
+  SudoRequest,
+  SecretRequest,
+  StatusUpdate,
+  NotificationShow,
+  NotificationClear,
+  VoiceStatus,
+  VoiceTranscript,
+  BrowserProgress,
+  BackgroundComplete,
+  ReviewSummary,
+  SubagentSpawnRequested,
+  SubagentStart,
+  SubagentThinking,
+  SubagentTool,
+  SubagentProgress,
+  SubagentComplete,
+  ErrorEvent,
+  GatewayStderr,
+  GatewayStartTimeout,
+  GatewayProtocolError
+]).pipe(Schema.toTaggedUnion('type'))
+
+/** The decoded, typed event. Inferred from the schema — never hand-declared. */
+export type GatewayEvent = typeof GatewayEventSchema.Type
