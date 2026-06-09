@@ -14,6 +14,7 @@ import {
   upsertToolPart
 } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
+import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { setClarifyRequest } from '@/store/clarify'
@@ -410,6 +411,10 @@ export function useMessageStream({
       phase: 'running' | 'complete',
       sourceEventType?: string
     ) => {
+      // Text deltas flush on a timer but tool events apply now; flush first so
+      // a tool part can't jump ahead of the text that preceded it.
+      flushQueuedDeltas(sessionId)
+
       if (!nativeSubagentSessionsRef.current.has(sessionId)) {
         for (const subagentPayload of delegateTaskPayloads(payload, phase, sourceEventType)) {
           upsertSubagent(
@@ -428,7 +433,7 @@ export function useMessageStream({
         { pending: m => phase !== 'complete' || (m.pending ?? false) }
       )
     },
-    [mutateStream]
+    [flushQueuedDeltas, mutateStream]
   )
 
   const completeAssistantMessage = useCallback(
@@ -437,11 +442,19 @@ export function useMessageStream({
 
       const completedState = updateSessionState(sessionId, state => {
         // Late completion from an already-cancelled turn: cancelRun has
-        // already finalized the bubble and added the [interrupted] marker;
-        // re-running the dedupe below would erase that marker and replace
-        // the partial with the (just-cancelled) full text.
+        // already finalized the bubble (kept the partial text, dropped it if
+        // empty). Re-running the dedupe below would replace the partial with
+        // the just-cancelled full text, so we settle and bail instead.
         if (state.interrupted) {
-          return state
+          return {
+            ...state,
+            awaitingResponse: false,
+            busy: false,
+            needsInput: false,
+            pendingBranchGroup: null,
+            streamId: null,
+            turnStartedAt: null
+          }
         }
 
         const streamId = state.streamId
@@ -530,7 +543,8 @@ export function useMessageStream({
           pendingBranchGroup: null,
           awaitingResponse: false,
           busy: false,
-          needsInput: false
+          needsInput: false,
+          turnStartedAt: null
         }
       })
 
@@ -588,7 +602,8 @@ export function useMessageStream({
           sawAssistantPayload: true,
           awaitingResponse: false,
           busy: false,
-          needsInput: false
+          needsInput: false,
+          turnStartedAt: null
         }
       })
     },
@@ -599,6 +614,9 @@ export function useMessageStream({
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+      if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
+        return
+      }
       const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
@@ -672,7 +690,8 @@ export function useMessageStream({
               if (busy) {
                 return {
                   ...state,
-                  busy
+                  busy,
+                  turnStartedAt: state.turnStartedAt ?? Date.now()
                 }
               }
 
@@ -685,7 +704,8 @@ export function useMessageStream({
                 awaitingResponse: false,
                 busy,
                 pendingBranchGroup: null,
-                streamId: null
+                streamId: null,
+                turnStartedAt: null
               }
             })
           }
@@ -724,7 +744,8 @@ export function useMessageStream({
           busy: true,
           awaitingResponse: true,
           sawAssistantPayload: false,
-          interrupted: false
+          interrupted: false,
+          turnStartedAt: Date.now()
         }))
 
         if (isActiveEvent) {

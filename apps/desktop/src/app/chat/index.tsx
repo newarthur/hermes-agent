@@ -72,6 +72,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickFolders: () => void
   onPickImages: () => void
   onRemoveAttachment: (id: string) => void
+  onSteer: (text: string) => Promise<boolean> | boolean
   onSubmit: (
     text: string,
     options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }
@@ -123,7 +124,10 @@ function ChatHeader({
 
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
-      <div className="min-w-0 flex-1">
+      <div
+        className="min-w-0 flex-1"
+        style={{ maxWidth: 'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right) - var(--titlebar-tools-width) - 1.5rem)' }}
+      >
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -134,11 +138,11 @@ function ChatHeader({
           title={title}
         >
           <Button
-            className="pointer-events-auto h-6 min-w-0 gap-1 border border-transparent bg-transparent px-2 py-0 text-(--ui-text-secondary) hover:border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground data-[state=open]:border-(--ui-stroke-tertiary) data-[state=open]:bg-(--ui-control-active-background) [-webkit-app-region:no-drag]"
+            className="pointer-events-auto flex h-6 min-w-0 max-w-full gap-1 border border-transparent bg-transparent px-2 py-0 text-(--ui-text-secondary) hover:border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground data-[state=open]:border-(--ui-stroke-tertiary) data-[state=open]:bg-(--ui-control-active-background) [-webkit-app-region:no-drag]"
             type="button"
             variant="ghost"
           >
-            <h2 className="max-w-[52vw] truncate text-[0.75rem] font-medium leading-none">{title}</h2>
+            <h2 className="min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none">{title}</h2>
             <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
           </Button>
         </SessionActionsMenu>
@@ -164,6 +168,7 @@ export function ChatView({
   onPickFolders,
   onPickImages,
   onRemoveAttachment,
+  onSteer,
   onSubmit,
   onThreadMessagesChange,
   onEdit,
@@ -370,6 +375,7 @@ export function ChatView({
                 onPickFolders={onPickFolders}
                 onPickImages={onPickImages}
                 onRemoveAttachment={onRemoveAttachment}
+                onSteer={onSteer}
                 onSubmit={onSubmit}
                 onTranscribeAudio={onTranscribeAudio}
                 queueSessionKey={selectedSessionId || activeSessionId}
