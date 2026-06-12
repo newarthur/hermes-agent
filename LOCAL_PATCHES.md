@@ -1,7 +1,7 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-05-12
+> 最后更新: 2026-06-13
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
