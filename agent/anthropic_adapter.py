@@ -751,14 +751,12 @@ def build_anthropic_client(
     from httpx import Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
-
-    # Kimi Coding endpoint uses https://api.kimi.com/coding/v1 for OpenAI-
-    # compatible API calls (e.g. /models health checks), but the Anthropic
-    # SDK appends /v1/messages itself. Passing /coding/v1 to the SDK
-    # produces /coding/v1/v1/messages and Kimi returns HTTP 404.
-    if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
-        normalized_base_url = "https://api.kimi.com/coding"
-
+    if normalized_base_url:
+        import re as _re
+        # Anthropic SDK appends /v1/messages itself. Strip a trailing /v1 so
+        # endpoints such as Kimi Coding's configured /coding/v1 do not become
+        # /coding/v1/v1/messages.
+        normalized_base_url = _re.sub(r"/v1/?$", "", normalized_base_url.rstrip("/"))
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     kwargs = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),

@@ -35,12 +35,14 @@ const {
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
-const { PortPool } = require('./port-pool.cjs')
+const { waitForDashboardPort } = require('./backend-ready.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
-const { buildDesktopBackendEnv } = require('./backend-env.cjs')
+const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
+const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
+const { worktreesForIpc } = require('./git-worktrees.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const {
   buildPosixCleanupScript,
@@ -61,6 +63,7 @@ const {
   cookiesHaveLiveSession,
   normAuthMode,
   normalizeRemoteBaseUrl,
+  pathWithGlobalRemoteProfile,
   profileRemoteOverride,
   resolveAuthMode,
   resolveTestWsUrl,
@@ -111,12 +114,6 @@ if (USER_DATA_OVERRIDE) {
   app.setPath('userData', resolvedUserData)
 }
 
-const PORT_FLOOR = 9120
-const PORT_CEILING = 9199
-// In-process port reservations that close the pickPort() TOCTOU window where
-// two concurrent backend spawns could be handed the same port. See
-// port-pool.cjs for the full rationale.
-const portPool = new PortPool(PORT_FLOOR, PORT_CEILING)
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged
 const IS_MAC = process.platform === 'darwin'
@@ -245,8 +242,18 @@ if (INSTALL_STAMP) {
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
 function resolveHermesHome() {
-  if (process.env.HERMES_HOME) return path.resolve(process.env.HERMES_HOME)
+  if (process.env.HERMES_HOME) return normalizeHermesHomeRoot(process.env.HERMES_HOME)
   if (USER_DATA_OVERRIDE) return path.join(path.resolve(USER_DATA_OVERRIDE), 'hermes-home')
+  if (IS_WINDOWS) {
+    // A GUI app launched from Explorer inherits the environment block captured
+    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
+    // process.env even though the CLI (a fresh shell) sees it. Without this the
+    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
+    // inference provider configured" despite a valid configured home (#45471).
+    // Consult the live User-scoped registry value before the default below.
+    const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
+    if (fromRegistry) return normalizeHermesHomeRoot(fromRegistry)
+  }
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
     const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
     const legacy = path.join(app.getPath('home'), '.hermes')
@@ -386,6 +393,58 @@ function writePersistedThemeSource(mode) {
 }
 
 nativeTheme.themeSource = readPersistedThemeSource()
+
+// Window translucency (see-through window). One lever, 0–100; 0 = off (the
+// default). Mapped to the native window opacity so the desktop shows through
+// the whole window. Persisted so a cold launch applies it at window creation,
+// before the renderer reports its value. macOS + Windows only; `setOpacity` is
+// a no-op on Linux. See store/translucency.
+const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath('userData'), 'translucency.json')
+
+function clampIntensity(value) {
+  const n = Math.round(Number(value))
+
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0
+}
+
+function readPersistedTranslucency() {
+  try {
+    return clampIntensity(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')).intensity)
+  } catch {
+    return 0
+  }
+}
+
+function writePersistedTranslucency(intensity) {
+  try {
+    fs.mkdirSync(path.dirname(TRANSLUCENCY_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify({ intensity }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[translucency] write failed: ${error.message}`)
+  }
+}
+
+let translucencyIntensity = readPersistedTranslucency()
+
+// Map the 0–100 lever to a window opacity. Floor at 0.3 so the most see-through
+// setting is still usable rather than nearly invisible. 0 → fully opaque.
+function windowOpacity() {
+  return 1 - (translucencyIntensity / 100) * 0.7
+}
+
+// Re-apply translucency to a live window (runtime toggle, no recreation).
+// `setOpacity` is a no-op on Linux, which is fine — it just stays opaque there.
+function applyWindowTranslucency(win) {
+  if (!win || win.isDestroyed() || typeof win.setOpacity !== 'function') {
+    return
+  }
+
+  try {
+    win.setOpacity(windowOpacity())
+  } catch (error) {
+    rememberLog(`[translucency] apply failed: ${error.message}`)
+  }
+}
 
 function isHexColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
@@ -1788,6 +1847,44 @@ async function applyUpdates(opts = {}) {
   }
 }
 
+async function handOffWindowsBootstrapRecovery(reason) {
+  if (!IS_WINDOWS || !IS_PACKAGED) return false
+
+  const updater = resolveUpdaterBinary()
+  if (!updater) return false
+
+  const updateRoot = resolveUpdateRoot()
+  const { branch: configuredBranch } = readDesktopUpdateConfig()
+  const branch = directoryExists(path.join(updateRoot, '.git'))
+    ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    : configuredBranch || DEFAULT_UPDATE_BRANCH
+  const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
+  const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
+  const updaterArgs = fileExists(venvHermes) ? ['--update', '--branch', branch] : ['--repair', '--branch', branch]
+
+  await releaseBackendLockForUpdate(updateRoot)
+
+  const child = spawn(updater, updaterArgs, {
+    cwd: HERMES_HOME,
+    env: {
+      ...process.env,
+      HERMES_HOME,
+      PATH: [path.join(HERMES_HOME, 'node', 'bin'), venvBin, process.env.PATH].filter(Boolean).join(path.delimiter)
+    },
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false
+  })
+  child.unref()
+
+  rememberLog(`[bootstrap] handed off ${reason} recovery to updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release app.asar`)
+  setTimeout(() => {
+    app.quit()
+  }, 600)
+
+  return true
+}
+
 // Resolve the hermes CLI to drive an in-app update: prefer the venv shim in
 // the install we're updating, fall back to `hermes` on PATH.
 function resolveHermesCliBinary(updateRoot) {
@@ -2385,6 +2482,14 @@ async function ensureRuntime(backend) {
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
 
+    if (await handOffWindowsBootstrapRecovery('bootstrap-needed')) {
+      const handoffError = new Error('Hermes recovery was handed off to Hermes Setup. The desktop will restart when recovery completes.')
+      handoffError.isBootstrapFailure = true
+      handoffError.bootstrapHandedOff = true
+      bootstrapFailure = handoffError
+      throw handoffError
+    }
+
     // Eagerly flip the bootstrap UI state to 'active' so the renderer
     // shows the install overlay BEFORE the runner finishes fetching the
     // manifest (which on slow networks can take tens of seconds and would
@@ -2514,24 +2619,6 @@ async function ensureRuntime(backend) {
   return backend
 }
 
-function isPortAvailable(port) {
-  return new Promise(resolve => {
-    const server = net.createServer()
-    server.once('error', () => resolve(false))
-    server.once('listening', () => {
-      server.close(() => resolve(true))
-    })
-    server.listen(port, '127.0.0.1')
-  })
-}
-
-async function pickPort() {
-  const port = await portPool.reserve(isPortAvailable)
-  if (port === null) {
-    throw new Error(`No free localhost port in ${PORT_FLOOR}-${PORT_CEILING}`)
-  }
-  return port
-}
 
 function fetchJson(url, token, options = {}) {
   return new Promise((resolve, reject) => {
@@ -4609,25 +4696,14 @@ async function spawnPoolBackend(profile, entry) {
     }
   }
 
-  const port = await pickPort()
   const token = crypto.randomBytes(32).toString('base64url')
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
-  const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
-  let backend
-  let hermesCwd
-  let webDist
-  try {
-    backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
-    hermesCwd = resolveHermesCwd()
-    webDist = resolveWebDist()
-  } catch (error) {
-    // These run before the child exists / its exit handler is attached, so a
-    // throw here would otherwise leak the reservation and slowly exhaust the
-    // 9120-9199 range across switch cycles in one app session.
-    portPool.release(port)
-    throw error
-  }
+  // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+  const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
+  const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
+  const hermesCwd = resolveHermesCwd()
+  const webDist = resolveWebDist()
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
@@ -4655,7 +4731,6 @@ async function spawnPoolBackend(profile, entry) {
     })
   )
   entry.process = child
-  entry.port = port
   entry.token = token
 
   child.stdout.on('data', rememberLog)
@@ -4669,19 +4744,21 @@ async function spawnPoolBackend(profile, entry) {
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     backendPool.delete(profile)
-    portPool.release(port)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     backendPool.delete(profile)
-    portPool.release(port)
     if (!ready) {
       rejectStart?.(
         new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
       )
     }
   })
+
+  // Discover the ephemeral port the child bound to
+  const port = await Promise.race([waitForDashboardPort(child), startFailed])
+  entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
@@ -4710,7 +4787,6 @@ function stopPoolBackend(profile) {
   const entry = backendPool.get(profile)
   if (!entry) return
   backendPool.delete(profile)
-  if (entry.port) portPool.release(entry.port)
   if (entry.process && !entry.process.killed) {
     try {
       entry.process.kill('SIGTERM')
@@ -4796,11 +4872,6 @@ async function startHermes() {
   }
   if (connectionPromise) return connectionPromise
 
-  // Hoisted so the outer .catch can release a port reserved by pickPort() when
-  // a throw (e.g. ensureRuntime failing) happens before the child's exit
-  // handler is attached. Stays null on the remote path (no port picked).
-  let reservedPort = null
-
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
     // Resolve for the desktop's primary profile so a per-profile remote
@@ -4828,11 +4899,9 @@ async function startHermes() {
       }
     }
 
-    await advanceBootProgress('backend.port', 'Finding an open local port', 16)
-    const port = await pickPort()
-    reservedPort = port
     const token = crypto.randomBytes(32).toString('base64url')
-    const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
+    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+    const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
@@ -4899,7 +4968,6 @@ async function startHermes() {
       )
       hermesProcess = null
       connectionPromise = null
-      portPool.release(port)
       sendBackendExit({ code: null, signal: null, error: error.message })
       rejectBackendStart?.(error)
     })
@@ -4907,7 +4975,6 @@ async function startHermes() {
       rememberLog(`Hermes backend exited (${signal || code})`)
       hermesProcess = null
       connectionPromise = null
-      portPool.release(port)
       sendBackendExit({ code, signal })
       if (!backendReady) {
         const message = `Hermes backend exited before it became ready (${signal || code}).`
@@ -4927,6 +4994,10 @@ async function startHermes() {
         )
       }
     })
+
+    await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+    // Discover the ephemeral port the child bound to
+    const port = await Promise.race([waitForDashboardPort(hermesProcess), backendStartFailed])
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
@@ -4967,7 +5038,6 @@ async function startHermes() {
       { allowDecrease: true }
     )
     connectionPromise = null
-    portPool.release(reservedPort)
     throw error
   })
 
@@ -5014,64 +5084,75 @@ function focusWindow(win) {
   win.focus()
 }
 
+function spawnSecondaryWindow({ sessionId, watch, newSession } = {}) {
+  const icon = getAppIconPath()
+  const win = new BrowserWindow({
+    width: SESSION_WINDOW_MIN_WIDTH,
+    height: SESSION_WINDOW_MIN_HEIGHT,
+    minWidth: SESSION_WINDOW_MIN_WIDTH,
+    minHeight: SESSION_WINDOW_MIN_HEIGHT,
+    title: 'Hermes',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: getTitleBarOverlayOptions(),
+    trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
+    vibrancy: IS_MAC ? 'sidebar' : undefined,
+    opacity: windowOpacity(),
+    icon,
+    // Don't show until the renderer's first themed paint is ready. macOS
+    // `vibrancy` ignores `backgroundColor` and paints a translucent OS
+    // material (which follows the OS appearance, not the app theme), so a
+    // dark-themed app on a light-mode Mac flashes white until the renderer
+    // covers it. ready-to-show fires after the boot-time paint in
+    // themes/context.tsx, so the window appears already themed.
+    show: false,
+    backgroundColor: getWindowBackgroundColor(),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      webviewTag: true,
+      sandbox: true,
+      nodeIntegration: false,
+      devTools: true
+    }
+  })
+
+  if (IS_MAC) {
+    win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
+  }
+
+  win.once('ready-to-show', () => {
+    if (!win.isDestroyed()) win.show()
+  })
+
+  win.on('will-enter-full-screen', () => sendWindowStateChanged(true))
+  win.on('enter-full-screen', () => sendWindowStateChanged(true))
+  win.on('will-leave-full-screen', () => sendWindowStateChanged(false))
+  win.on('leave-full-screen', () => sendWindowStateChanged(false))
+
+  wireCommonWindowHandlers(win)
+
+  win.loadURL(
+    buildSessionWindowUrl(sessionId, {
+      devServer: DEV_SERVER,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      watch,
+      newSession
+    })
+  )
+
+  return win
+}
+
 // Open (or focus) a standalone window for a single chat session.
 function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => {
-    const icon = getAppIconPath()
-    const win = new BrowserWindow({
-      width: SESSION_WINDOW_MIN_WIDTH,
-      height: SESSION_WINDOW_MIN_HEIGHT,
-      minWidth: SESSION_WINDOW_MIN_WIDTH,
-      minHeight: SESSION_WINDOW_MIN_HEIGHT,
-      title: 'Hermes',
-      titleBarStyle: 'hidden',
-      titleBarOverlay: getTitleBarOverlayOptions(),
-      trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-      vibrancy: IS_MAC ? 'sidebar' : undefined,
-      icon,
-      // Don't show until the renderer's first themed paint is ready. macOS
-      // `vibrancy` ignores `backgroundColor` and paints a translucent OS
-      // material (which follows the OS appearance, not the app theme), so a
-      // dark-themed app on a light-mode Mac flashes white until the renderer
-      // covers it. ready-to-show fires after the boot-time paint in
-      // themes/context.tsx, so the window appears already themed.
-      show: false,
-      backgroundColor: getWindowBackgroundColor(),
-      webPreferences: {
-        preload: path.join(__dirname, 'preload.cjs'),
-        contextIsolation: true,
-        webviewTag: true,
-        sandbox: true,
-        nodeIntegration: false,
-        devTools: true
-      }
-    })
+  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+}
 
-    if (IS_MAC) {
-      win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
-    }
-
-    win.once('ready-to-show', () => {
-      if (!win.isDestroyed()) win.show()
-    })
-
-    win.on('will-enter-full-screen', () => sendWindowStateChanged(true))
-    win.on('enter-full-screen', () => sendWindowStateChanged(true))
-    win.on('will-leave-full-screen', () => sendWindowStateChanged(false))
-    win.on('leave-full-screen', () => sendWindowStateChanged(false))
-
-    wireCommonWindowHandlers(win)
-
-    win.loadURL(
-      buildSessionWindowUrl(sessionId, {
-        devServer: DEV_SERVER,
-        rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
-        watch
-      })
-    )
-
-    return win
-  })
+// Open a fresh compact window on the new-session draft (#/). Not registry-keyed:
+// like ⌘N in a browser, every press opens a new window — and a draft window that
+// later converts to a real session must not get refocused as if it were blank.
+function createNewSessionWindow() {
+  return spawnSecondaryWindow({ newSession: true })
 }
 
 function createWindow() {
@@ -5092,6 +5173,7 @@ function createWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
+    opacity: windowOpacity(),
     icon,
     // Hidden until the first themed paint so macOS `vibrancy` (which ignores
     // `backgroundColor` and follows the OS appearance) can't flash a light
@@ -5254,6 +5336,11 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   }
 
   createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+
+  return { ok: true }
+})
+ipcMain.handle('hermes:window:openNewSession', async () => {
+  createNewSessionWindow()
 
   return { ok: true }
 })
@@ -5526,9 +5613,14 @@ ipcMain.handle('hermes:api', async (_event, request) => {
 
   await prepareProfileDeleteRequest(request)
 
-  const connection = await ensureBackend(request?.profile)
+  const profile = request?.profile
+  const connection = await ensureBackend(profile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-  const url = `${connection.baseUrl}${request.path}`
+  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
+    globalRemote: globalRemoteActive(),
+    profileRemoteOverride: profileHasRemoteOverride(profile)
+  })
+  const url = `${connection.baseUrl}${requestPath}`
   // OAuth gateways authenticate REST via the HttpOnly session cookie held in
   // the OAuth partition — route through Electron's net stack bound to that
   // session so the cookie attaches automatically. Token/local modes keep using
@@ -5549,11 +5641,30 @@ ipcMain.handle('hermes:api', async (_event, request) => {
 
 ipcMain.handle('hermes:notify', (_event, payload) => {
   if (!Notification.isSupported()) return false
-  new Notification({
+  // Action buttons render only on signed macOS builds; elsewhere they're dropped
+  // and the body click still works.
+  const actions = Array.isArray(payload?.actions) ? payload.actions : []
+  const notification = new Notification({
     title: payload?.title || 'Hermes',
     body: payload?.body || '',
-    silent: Boolean(payload?.silent)
-  }).show()
+    silent: Boolean(payload?.silent),
+    actions: actions.map(action => ({ type: 'button', text: String(action?.text || '') }))
+  })
+  notification.on('click', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    focusWindow(mainWindow)
+    if (payload?.sessionId) {
+      mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
+    }
+  })
+  notification.on('action', (_actionEvent, index) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    const action = actions[index]
+    if (action?.id) {
+      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+    }
+  })
+  notification.show()
   return true
 })
 
@@ -5670,6 +5781,23 @@ ipcMain.on('hermes:native-theme', (_event, mode) => {
   if (nativeTheme.themeSource !== mode) {
     nativeTheme.themeSource = mode
     writePersistedThemeSource(mode)
+  }
+})
+
+// See-through window translucency. Persist + re-apply opacity to every open
+// window at runtime (no recreation, so caching/sessions are untouched).
+ipcMain.on('hermes:translucency', (_event, payload) => {
+  const next = clampIntensity(payload && payload.intensity)
+
+  if (next === translucencyIntensity) {
+    return
+  }
+
+  translucencyIntensity = next
+  writePersistedTranslucency(next)
+
+  for (const win of BrowserWindow.getAllWindows()) {
+    applyWindowTranslucency(win)
   }
 })
 
@@ -5923,6 +6051,8 @@ function disposeTerminalSession(id) {
 ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
 
 ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(startPath))
+
+ipcMain.handle('hermes:fs:worktrees', async (_event, cwds) => worktreesForIpc(cwds))
 
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   if (!nodePty) {
