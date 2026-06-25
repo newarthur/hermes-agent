@@ -56,6 +56,7 @@
 - `hermes_cli/auth.py`
 - `hermes_cli/model_switch.py` 中 Kimi `/v1` 剥离逻辑
 - `hermes_cli/runtime_provider.py`
+- `hermes_cli/models.py`（添加 `kimi-k2.7-highspeed` 到 TUI 模型列表）
 - `agent/anthropic_adapter.py`
 - `tests/hermes_cli/test_timeouts.py`
 - `tests/hermes_cli/test_api_key_providers.py`
@@ -80,6 +81,7 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 - stale `chat_completions` 不会覆盖 Kimi Coding 的 URL 检测结果。
 - `tests/hermes_cli/test_timeouts.py::test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk` 通过。
 - Kimi 家族 endpoint 上，包含工具调用的 assistant 历史消息缺少 reasoning 内容时会补空字符串，避免 Kimi 400。
+- TUI `/model` 菜单显示 `kimi-k2.7-code` 和 `kimi-k2.7-highspeed`（通过 `hermes_cli/models.py` 的 `_PROVIDER_MODELS["kimi-coding"]` 列表）。
 
 ---
 
