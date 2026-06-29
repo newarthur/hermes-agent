@@ -973,6 +973,66 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def strip_kimi_incompatible_thinking_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove provider-native thinking blocks that Kimi rejects on replay.
+
+    Kimi Coding's ``/coding`` route expects the request-level thinking toggle
+    (``extra_body.thinking={"type":"enabled"}``) plus ``reasoning_content``
+    echo-back for assistant turns. It does *not* accept Anthropic/Codex-style
+    historical content blocks such as ``{"type":"thinking", ...}`` that can
+    be present after switching a long-lived session from another provider to
+    ``kimi-coding``. Those blocks produce HTTP 400 errors like
+    ``invalid thinking: only type=enabled is allowed for this model``.
+
+    This operates only on the per-call API copy. The persisted transcript keeps
+    the original reasoning blocks for UI/session history; the wire payload sent
+    to Kimi gets only visible text/tool blocks and the normal Kimi echo fields.
+    """
+    if not messages:
+        return messages
+
+    changed = False
+    sanitized: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            sanitized.append(msg)
+            continue
+
+        new_msg = dict(msg)
+        for key in ("reasoning_details", "anthropic_content_blocks", "codex_reasoning_items"):
+            if key in new_msg:
+                new_msg.pop(key, None)
+                changed = True
+
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            new_content: List[Any] = []
+            removed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in {"thinking", "redacted_thinking"}:
+                    removed = True
+                    continue
+                new_content.append(dict(block) if isinstance(block, dict) else block)
+            if removed:
+                new_msg["content"] = new_content
+                if not new_content and not new_msg.get("tool_calls"):
+                    # Preserve an internal marker so the existing
+                    # drop_thinking_only_and_merge_users() pass recognizes the
+                    # now-empty assistant turn as thinking-only and removes it
+                    # from the wire replay instead of sending an empty assistant
+                    # message to Kimi.
+                    new_msg["_kimi_stripped_thinking_only"] = True
+                changed = True
+
+        sanitized.append(new_msg)
+
+    if changed:
+        _ra().logger.debug("Kimi pre-call sanitizer: stripped incompatible thinking blocks from API messages")
+        return sanitized
+    return messages
+
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 

@@ -47,9 +47,9 @@
 |------|-----|
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch` |
 | 优先级 | critical |
-| 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化、Kimi tool-call reasoning/content padding |
-| 上游冲突 | 上游可能恢复 Moonshot endpoint 或缺少 Kimi Coding 双端点处理 |
-| 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404，以及跨 Provider 降级到 Kimi 时 tool-call 历史消息 HTTP 400 |
+| 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化、Kimi tool-call reasoning/content padding、跨 provider thinking block 清洗 |
+| 上游冲突 | 上游可能恢复 Moonshot endpoint、缺少 Kimi Coding 双端点处理，或继续向 Kimi replay Anthropic/Codex `thinking` content blocks |
+| 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404、跨 Provider 降级到 Kimi 时 tool-call 历史消息 HTTP 400，以及从 Codex/Anthropic 长会话切到 Kimi 时 `invalid thinking` 400 |
 
 包含文件：
 
@@ -58,7 +58,12 @@
 - `hermes_cli/runtime_provider.py`
 - `hermes_cli/models.py`（添加 `kimi-k2.7-highspeed` 到 TUI 模型列表）
 - `agent/anthropic_adapter.py`
+- `agent/agent_runtime_helpers.py`
+- `agent/conversation_loop.py`
+- `agent/chat_completion_helpers.py`
+- `run_agent.py`
 - `tests/hermes_cli/test_timeouts.py`
+- `tests/run_agent/test_run_agent.py`
 - `tests/hermes_cli/test_api_key_providers.py`
 - `tests/hermes_cli/test_user_providers_model_switch.py`
 - `agent/models_dev.py`
@@ -81,6 +86,7 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 - stale `chat_completions` 不会覆盖 Kimi Coding 的 URL 检测结果。
 - `tests/hermes_cli/test_timeouts.py::test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk` 通过。
 - Kimi 家族 endpoint 上，包含工具调用的 assistant 历史消息缺少 reasoning 内容时会补空字符串，避免 Kimi 400。
+- 切换到 Kimi Coding 前会在 API-call-time copy 中移除 Anthropic/Codex 历史 `thinking` / `redacted_thinking` content blocks、`reasoning_details`、`anthropic_content_blocks`、`codex_reasoning_items`，避免 `invalid thinking: only type=enabled is allowed for this model`。
 - TUI `/model` 菜单显示 `kimi-k2.7-code` 和 `kimi-k2.7-highspeed`（通过 `hermes_cli/models.py` 的 `_PROVIDER_MODELS["kimi-coding"]` 列表）。
 
 ---

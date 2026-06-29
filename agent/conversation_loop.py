@@ -835,6 +835,8 @@ def run_conversation(
         # a thinking-only turn. Runs on the per-call copy only — the
         # stored conversation history keeps the reasoning block for the
         # UI transcript and session persistence.
+        if agent._needs_kimi_tool_reasoning():
+            api_messages = agent._strip_kimi_incompatible_thinking_blocks(api_messages)
         api_messages = agent._drop_thinking_only_and_merge_users(
             api_messages,
             drop_codex_reasoning_items=agent.api_mode != "codex_responses",
@@ -1004,6 +1006,12 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                if agent._needs_kimi_tool_reasoning():
+                    api_messages = agent._strip_kimi_incompatible_thinking_blocks(api_messages)
+                    api_messages = agent._drop_thinking_only_and_merge_users(
+                        api_messages,
+                        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+                    )
                 api_kwargs = agent._build_api_kwargs(api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)

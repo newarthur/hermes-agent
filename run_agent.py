@@ -3403,6 +3403,8 @@ class AIAgent:
         elif content is not None and content != "":
             return False
         # Content is empty-ish. Is there reasoning to make it thinking-only?
+        if msg.get("_kimi_stripped_thinking_only") is True:
+            return True
         reasoning = msg.get("reasoning_content") or msg.get("reasoning")
         if isinstance(reasoning, str) and reasoning.strip():
             return True
@@ -3434,6 +3436,12 @@ class AIAgent:
             messages,
             drop_codex_reasoning_items=drop_codex_reasoning_items,
         )
+
+    @staticmethod
+    def _strip_kimi_incompatible_thinking_blocks(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Forwarder — see ``agent.agent_runtime_helpers.strip_kimi_incompatible_thinking_blocks``."""
+        from agent.agent_runtime_helpers import strip_kimi_incompatible_thinking_blocks
+        return strip_kimi_incompatible_thinking_blocks(messages)
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:

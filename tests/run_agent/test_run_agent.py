@@ -1624,6 +1624,51 @@ class TestBuildApiKwargs:
 
         assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
 
+    def test_kimi_coding_strips_historical_thinking_blocks_for_replay(self, agent):
+        """Switching a long Codex/Anthropic session to Kimi must not replay
+        provider-native thinking content blocks that Kimi rejects with HTTP 400.
+        """
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private chain"},
+                    {"type": "text", "text": "visible"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                ],
+                "reasoning_details": [{"type": "thinking", "thinking": "private chain"}],
+                "anthropic_content_blocks": [{"type": "thinking", "thinking": "private chain"}],
+                "codex_reasoning_items": [{"type": "reasoning", "id": "rs_1"}],
+                "reasoning_content": " ",
+            },
+        ]
+
+        sanitized = agent._strip_kimi_incompatible_thinking_blocks(messages)
+
+        assert messages[1]["content"][0]["type"] == "thinking"
+        assert sanitized[1]["content"] == [{"type": "text", "text": "visible"}]
+        assert "reasoning_details" not in sanitized[1]
+        assert "anthropic_content_blocks" not in sanitized[1]
+        assert "codex_reasoning_items" not in sanitized[1]
+        assert sanitized[1]["reasoning_content"] == " "
+
+    def test_kimi_coding_stripped_thinking_only_turn_is_dropped(self, agent):
+        messages = [
+            {"role": "user", "content": "before"},
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "private"}],
+                "reasoning_details": [{"type": "thinking", "thinking": "private"}],
+            },
+            {"role": "user", "content": "after"},
+        ]
+
+        sanitized = agent._strip_kimi_incompatible_thinking_blocks(messages)
+        sanitized = agent._drop_thinking_only_and_merge_users(sanitized)
+
+        assert sanitized == [{"role": "user", "content": "before\n\nafter"}]
+
     def test_kimi_coding_endpoint_disables_thinking(self, agent):
         """When reasoning_config.enabled=False, thinking should be disabled
         and reasoning_effort should be omitted entirely — mirroring Kimi
