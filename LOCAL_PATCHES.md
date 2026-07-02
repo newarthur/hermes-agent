@@ -1,7 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-06-13
+> 最后更新: 2026-07-02
+> 上游合并: 2026-07-02 (`upstream/main` 领先本地 656 commits，merge base 后本地 74 commits 含 merge commit)
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
@@ -314,39 +315,44 @@ cd /root/.hermes/hermes-agent
 /root/.hermes/hermes-agent-patches/restore-local-patches.sh
 ```
 
-脚本会按顺序应用：
+脚本会应用并验证：
 
-1. `01-kimi-coding-plan-runtime.patch`
-2. `02-gemini-cli-cloudcode-compat.patch`
-3. `03-persona-model-routing.patch`
-4. `04-telegram-model-picker-cleanup.patch`
-5. `05-kimi-fallback-fix.patch`
+1. `00-current-local-overlay.patch`（由当前 `upstream/main..HEAD` 生成的 canonical overlay，唯一恢复入口）
+
+旧的功能级 patch `01-06` 已同步刷新，仅作审计/参考；恢复时不独立顺序应用。
 
 然后执行：
 
 ```bash
 python3 -m py_compile \
-  cli.py gateway/run.py \
+  cli.py run_agent.py gateway/run.py gateway/slash_commands.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
+  agent/agent_runtime_helpers.py agent/chat_completion_helpers.py \
+  agent/conversation_loop.py agent/auxiliary_client.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
   hermes_cli/runtime_provider.py \
-  gateway/platforms/telegram.py \
-  run_agent.py
+  gateway/platforms/base.py plugins/platforms/telegram/adapter.py
 
 PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
   tests/hermes_cli/test_timeouts.py \
-  tests/agent/test_gemini_cloudcode.py -q
+  tests/hermes_cli/test_gemini_provider.py \
+  tests/agent/test_gemini_cloudcode.py \
+  tests/gateway/test_telegram_thread_fallback.py -q
+
+PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
+  tests/run_agent/test_run_agent.py \
+  -k 'kimi_coding_endpoint or kimi_coding_strips or kimi_coding_stripped' -q
 ```
 
 ### 手动恢复步骤
 
 1. 先用 `hermes-safe-update-with-local-patches` 完成 upstream sync / merge / backup。
 2. 确认工作树无冲突标记。
-3. 应用 `/root/.hermes/hermes-agent-patches/by-feature/` 下 5 个 patch。
+3. 应用 `/root/.hermes/hermes-agent-patches/by-feature/00-current-local-overlay.patch`。
 4. 运行语法检查和 targeted tests。
 5. 检查 picker 行为：`kimi-coding` 保留，`openai-codex` 保留，普通 `openai` 不作为独立 provider 显示。
 6. Review diff 后再提交。
@@ -356,27 +362,39 @@ PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
 ## 当前验证命令
 
 ```bash
+# 唯一恢复入口：canonical overlay
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/00-current-local-overlay.patch
+
+# 功能级 patch 仅作审计参考，也可反向校验
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-persona-model-routing.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/05-kimi-fallback-fix.patch
+git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/06-gemini-cli-auxiliary-compression.patch
 
 python3 -m py_compile \
-  cli.py gateway/run.py \
+  cli.py run_agent.py gateway/run.py gateway/slash_commands.py \
   agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
+  agent/agent_runtime_helpers.py agent/chat_completion_helpers.py \
+  agent/conversation_loop.py agent/auxiliary_client.py \
   agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
   hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
   hermes_cli/runtime_provider.py \
-  gateway/platforms/telegram.py \
-  run_agent.py
+  gateway/platforms/base.py plugins/platforms/telegram/adapter.py
 
 PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
   tests/cli/test_personality_none.py \
   tests/hermes_cli/test_user_providers_model_switch.py \
   tests/hermes_cli/test_models.py \
   tests/hermes_cli/test_timeouts.py \
-  tests/agent/test_gemini_cloudcode.py -q
+  tests/hermes_cli/test_gemini_provider.py \
+  tests/agent/test_gemini_cloudcode.py \
+  tests/gateway/test_telegram_thread_fallback.py -q
+
+PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
+  tests/run_agent/test_run_agent.py \
+  -k 'kimi_coding_endpoint or kimi_coding_strips or kimi_coding_stripped' -q
 ```
 
 ---
@@ -385,12 +403,13 @@ PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
 
 | 日期 | 说明 |
 |------|------|
-| 2026-04-29 | 首次整理并文档化本地 patch |
+| 2026-07-02 | 上游 sync 至 `upstream/main`（656 commits）；唯一恢复入口改为 `00-current-local-overlay.patch`；刷新 `01-06` 为审计参考；`gateway/platforms/telegram.py` 已随上游迁移至 `plugins/platforms/telegram/adapter.py`；更新 `LOCAL_PATCHES.md` 与 `restore-local-patches.sh` 验证清单 |
+| 2026-06-13 | 将 8 个文件级/功能级 patch 收敛为 `00-current-local-overlay.patch` 作为 canonical overlay |
+| 2026-05-07 | 将 `05-kimi-fallback-fix.patch` 补入正式 patch 清单，和 `restore-local-patches.sh` 保持一致 |
 | 2026-04-30 | 新增 `gemini-all-fixes.patch` 为正式恢复项 |
 | 2026-04-30 | 新增 Kimi Coding Anthropic SDK URL 归一化，修复 title generation 404 |
 | 2026-04-30 | 从 8 个文件级 patch 精简为 4 个功能级 patch；保留 Kimi/Gemini 核心修复和 openai-codex-only picker 策略 |
 | 2026-04-30 | 将 `05-kimi-reasoning-content-padding.patch` 合并进 `01-kimi-coding-plan-runtime.patch`，将 Gemini Code Assist tool-use 补丁合并进 `02-gemini-cli-cloudcode-compat.patch` |
-| 2026-05-07 | 将 `05-kimi-fallback-fix.patch` 补入正式 patch 清单，和 `restore-local-patches.sh` 保持一致 |
 
 ---
 
