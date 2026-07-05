@@ -190,6 +190,13 @@ class GatewaySlashCommandsMixin:
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
+        # Clear the per-session last-resolved-model cache so the next turn
+        # reads from current config instead of falling back to a stale model
+        # after a config change (#58403).
+        _lrm = getattr(self, "_last_resolved_model", None)
+        if _lrm is not None:
+            _lrm.pop(session_key, None)
+
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
         # previous conversation must not survive the reset.
@@ -1597,6 +1604,20 @@ class GatewaySlashCommandsMixin:
                             "api_mode": result.api_mode,
                         }
 
+                        # Write-through the non-secret parts to the session
+                        # store so the picked model survives a gateway restart
+                        # (api_key is never persisted).
+                        try:
+                            _self.session_store.set_model_override(
+                                _session_key,
+                                _self._session_model_overrides[_session_key],
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist session model override",
+                                exc_info=True,
+                            )
+
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
@@ -1830,6 +1851,19 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+
+            # Write-through the non-secret parts (model/provider/base_url) to
+            # the session store so the override survives a gateway restart.
+            # api_key/api_mode are never persisted — they are re-resolved via
+            # runtime provider resolution on rehydration.
+            try:
+                self.session_store.set_model_override(
+                    session_key, self._session_model_overrides[session_key]
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist session model override", exc_info=True
+                )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2907,12 +2941,13 @@ class GatewaySlashCommandsMixin:
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
+            "log": t("gateway.verbose.mode_log"),
         }
 
         # Read current effective mode for this platform via the resolver
@@ -3051,12 +3086,43 @@ class GatewaySlashCommandsMixin:
         # Parse args: either a focus topic (full compress) or the
         # boundary-aware "here [N]" form (partial compress).
         from hermes_cli.partial_compress import (
+            extract_compress_flags,
             parse_partial_compress_args,
             rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
+            summarize_compress_preview,
         )
         _raw_args = (event.get_command_args() or "").strip()
+        # Strip --preview/--dry-run/--aggressive before positional parsing
+        # so the flags coexist with 'here [N]' / focus-topic forms.
+        _raw_args, _preview, _aggressive = extract_compress_flags(_raw_args)
         partial, keep_last, focus_topic = parse_partial_compress_args(_raw_args)
+
+        _agg_note = ""
+        if _aggressive:
+            # LLM-free hard truncation is not supported on this surface —
+            # it would need its own transcript-persistence branch outside
+            # the guarded _compress_context rotation machinery (#44794).
+            _agg_note = t("gateway.compress.aggressive_unsupported")
+            if not _preview:
+                return _agg_note
+
+        if _preview:
+            # Report what WOULD be compressed — no agent, no writes.
+            from agent.model_metadata import estimate_request_tokens_rough
+            _pv_msgs = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in history
+                if m.get("role") in {"user", "assistant"} and m.get("content")
+            ]
+            approx_tokens = estimate_request_tokens_rough(_pv_msgs)
+            report = summarize_compress_preview(
+                _pv_msgs, partial, keep_last, focus_topic, approx_tokens
+            )
+            lines = [f"🗜️ {line}" for line in report["lines"]]
+            if _aggressive:
+                lines.append(_agg_note)
+            return "\n".join(lines)
 
         try:
             from run_agent import AIAgent
@@ -3082,10 +3148,14 @@ class GatewaySlashCommandsMixin:
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 
+            # Pass the FULL transcript (tool results included) — same
+            # rationale as the session-hygiene auto-compress in
+            # gateway/run.py (#3854): filtering to user/assistant-only
+            # starves the compressor's tool-result pruning and can trip the
+            # protect-first/last early-return on short filtered histories.
             msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
+                m for m in history
+                if m.get("role") in {"user", "assistant", "tool"}
             ]
 
             # Boundary-aware split: only the head is summarized; the most
@@ -3615,9 +3685,14 @@ class GatewaySlashCommandsMixin:
         source = event.source
         raw_args = event.get_command_args().strip()
         try:
-            include_all, include_unnamed, target = parse_session_listing_args(raw_args)
+            include_all, include_unnamed, target, search_query = (
+                parse_session_listing_args(raw_args)
+            )
         except ValueError as exc:
             return t("gateway.resume.parse_error", error=exc)
+
+        if search_query == "":
+            return "Usage: `/sessions search <query>`"
 
         if target:
             resume_event = dataclasses.replace(event, text=f"/resume {target}")
@@ -3637,7 +3712,10 @@ class GatewaySlashCommandsMixin:
             current_session_id=current_entry.session_id,
             include_all_sources=cross_origin,
             include_unnamed=include_unnamed,
-            limit=10,
+            search_query=search_query,
+            # Search filters at SQL level, so over-fetch before the visibility
+            # cut: origin-invisible matches would otherwise consume the page.
+            limit=50 if search_query else 10,
             exclude_sources=["tool"],
         )
         if not cross_origin:
@@ -3647,10 +3725,15 @@ class GatewaySlashCommandsMixin:
                 row for row in rows
                 if await self._resume_row_visible(source, row, allow_all=False)
             ]
+        rows = rows[:10]
+        if search_query:
+            title = f"Sessions matching “{search_query}”"
+        else:
+            title = "Sessions" if include_unnamed else "Named Sessions"
         return format_gateway_session_listing(
             rows,
             include_source=cross_origin,
-            title="Sessions" if include_unnamed else "Named Sessions",
+            title=title,
         )
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
@@ -4285,6 +4368,9 @@ class GatewaySlashCommandsMixin:
         a definitive BLOCKED message, same as the CLI deny flow.
 
         ``/deny`` denies the oldest; ``/deny all`` denies everything.
+        ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
+        reason that is relayed back to the agent so it can adapt instead of
+        only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -4299,10 +4385,24 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        args = event.get_command_args().strip().lower()
-        resolve_all = "all" in args
+        # Parse args: a leading "all" token denies every pending command;
+        # anything after it (or the whole arg string when "all" is absent) is
+        # captured verbatim as the optional deny reason relayed to the agent.
+        raw_args = event.get_command_args().strip()
+        tokens = raw_args.split()
+        resolve_all = bool(tokens) and tokens[0].lower() == "all"
+        if resolve_all:
+            reason = raw_args[len(tokens[0]):].strip()
+        else:
+            reason = raw_args
+        # Cap to a sane one-liner; the agent only needs a short hint.
+        if reason:
+            reason = reason[:280].strip()
 
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key, "deny", resolve_all=resolve_all,
+            reason=reason or None,
+        )
         if not count:
             return t("gateway.deny.no_pending")
 
@@ -4311,7 +4411,14 @@ class GatewaySlashCommandsMixin:
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        logger.info("User denied %d dangerous command(s) via /deny", count)
+        logger.info(
+            "User denied %d dangerous command(s) via /deny%s",
+            count, " (with reason)" if reason else "",
+        )
+        if reason:
+            if count > 1:
+                return t("gateway.deny.denied_reason_plural", count=count, reason=reason)
+            return t("gateway.deny.denied_reason_singular", reason=reason)
         if count > 1:
             return t("gateway.deny.denied_plural", count=count)
         return t("gateway.deny.denied_singular")
