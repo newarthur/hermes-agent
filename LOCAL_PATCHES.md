@@ -403,6 +403,7 @@ PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-11 | 受控合并 upstream/main 至 `b8880f124`（416 commits）；正式纳入 GPT-5.6 Sol/Terra/Luna 支持；`test_inventory.py` 唯一冲突通过同时保留本地 Kimi 别名去重测试与 upstream `explicit_only` 测试解决；重新生成 canonical overlay |
 | 2026-07-02 | 上游 sync 至 `upstream/main`（656 commits）；唯一恢复入口改为 `00-current-local-overlay.patch`；刷新 `01-06` 为审计参考；`gateway/platforms/telegram.py` 已随上游迁移至 `plugins/platforms/telegram/adapter.py`；更新 `LOCAL_PATCHES.md` 与 `restore-local-patches.sh` 验证清单 |
 | 2026-06-13 | 将 8 个文件级/功能级 patch 收敛为 `00-current-local-overlay.patch` 作为 canonical overlay |
 | 2026-05-07 | 将 `05-kimi-fallback-fix.patch` 补入正式 patch 清单，和 `restore-local-patches.sh` 保持一致 |
