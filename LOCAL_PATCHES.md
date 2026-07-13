@@ -55,6 +55,7 @@
 包含文件：
 
 - `hermes_cli/auth.py`
+- `hermes_cli/inventory.py`（canonical provider alias 去重，同时保留未认证的当前 provider 行）
 - `hermes_cli/model_switch.py` 中 Kimi `/v1` 剥离逻辑
 - `hermes_cli/runtime_provider.py`
 - `hermes_cli/models.py`（添加 `kimi-k2.7-highspeed` 到 TUI 模型列表）
@@ -67,6 +68,8 @@
 - `tests/run_agent/test_run_agent.py`
 - `tests/hermes_cli/test_api_key_providers.py`
 - `tests/hermes_cli/test_user_providers_model_switch.py`
+- `tests/hermes_cli/test_inventory.py`
+- `tests/hermes_cli/test_models_dev_preferred_merge.py`
 - `agent/models_dev.py`
 
 关键行为：
