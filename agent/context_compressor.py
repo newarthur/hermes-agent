@@ -2081,7 +2081,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Only (1) belongs in the long no-provider cooldown; (2) and every
             # other exception flow into the generic fallback logic so they get
             # a main-model retry before any cooldown. (#11978, #11914)
-            if isinstance(e, RuntimeError) and "no llm provider configured" in str(e).lower():
+            _runtime_error_text = str(e).lower()
+            _is_no_provider_runtime_error = isinstance(e, RuntimeError) and (
+                "no llm provider configured" in _runtime_error_text
+                or "could not be rebuilt after recovery" in _runtime_error_text
+            )
+            if _is_no_provider_runtime_error:
                 # No provider configured — long cooldown, unlikely to self-resolve
                 self._record_compression_failure_cooldown(
                     _SUMMARY_FAILURE_COOLDOWN_SECONDS,
