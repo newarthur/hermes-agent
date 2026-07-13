@@ -6876,7 +6876,16 @@ class TelegramAdapter(BasePlatformAdapter):
         outbound routing must all agree on the same normalized value.
         """
         chat = getattr(message, "chat", None)
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        raw_chat_type = getattr(chat, "type", "") if chat else ""
+        if raw_chat_type in (
+            getattr(ChatType, "GROUP", None),
+            getattr(ChatType, "SUPERGROUP", None),
+        ):
+            chat_type = "supergroup"
+        elif raw_chat_type == getattr(ChatType, "PRIVATE", None):
+            chat_type = "private"
+        else:
+            chat_type = str(raw_chat_type).split(".")[-1].lower()
         raw = getattr(message, "message_thread_id", None)
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_forum_group = chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False) is True
