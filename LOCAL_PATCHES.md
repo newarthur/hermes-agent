@@ -188,13 +188,14 @@ save_config_value("display.personality", personality_name)
 |------|-----|
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch` |
 | 优先级 | normal |
-| 修改类型 | Telegram model picker 消息清理 |
-| 上游冲突 | 上游可能没有旧 picker 消息删除逻辑 |
-| 保留理由 | 防止重复发送 model picker 消息，避免 inline keyboard 堆积 |
+| 修改类型 | Telegram model picker 消息清理、DM/forum topic thread metadata 归一化 |
+| 上游冲突 | 上游可能没有旧 picker 消息删除逻辑；ChatType enum/stub 归一化重构可能丢失 forum thread id |
+| 保留理由 | 防止重复发送 model picker 消息；确保 forum topic 与 General topic 使用稳定 thread session key |
 
 包含文件：
 
-- `gateway/platforms/telegram.py`
+- `plugins/platforms/telegram/adapter.py`
+- `tests/gateway/test_telegram_thread_fallback.py`
 
 关键行为：
 
@@ -208,6 +209,7 @@ if old_state and old_state.get("msg_id"):
 
 - Telegram 打开新的 model picker 前，会尝试删除同 chat 的旧 picker message。
 - 删除失败时静默忽略，不影响新 picker 发送。
+- `ChatType.GROUP`/`ChatType.SUPERGROUP` 即使来自 enum 或测试 stub，也能保留真实 forum thread id；普通群回复锚点仍不会被误当成 topic。
 
 
 ---
@@ -252,14 +254,16 @@ elif (
 |------|-----|
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/06-gemini-cli-auxiliary-compression.patch` |
 | 优先级 | critical（auxiliary.compression 依赖 Google Gemini CLI OAuth 时） |
-| 修改类型 | 让 `agent.auxiliary_client.resolve_provider_client()` 识别 `google-gemini-cli`，并路由到 `GeminiCloudCodeClient` |
-| 上游冲突 | 上游 auxiliary resolver 可能只支持 OpenAI-compatible / native Gemini API-key 路径，不识别 Gemini CLI 的 `cloudcode-pa://google` OAuth runtime |
-| 保留理由 | 用户偏好 Gemini CLI 交互式 OAuth/PKCE；`auxiliary.compression` 当前使用 `provider: google-gemini-cli`，需要避免错误回退到 OpenAI client 或缺失 credential |
+| 修改类型 | 让 `agent.auxiliary_client.resolve_provider_client()` 识别 `google-gemini-cli` 并路由到 `GeminiCloudCodeClient`；compression provider rebuild 失败分类 |
+| 上游冲突 | 上游 auxiliary resolver 可能只支持 OpenAI-compatible / native Gemini API-key 路径，不识别 Gemini CLI 的 `cloudcode-pa://google` OAuth runtime；异常分类重构可能把 provider rebuild 配置缺口误判为短暂错误 |
+| 保留理由 | 用户偏好 Gemini CLI 交互式 OAuth/PKCE；`auxiliary.compression` 当前使用 `provider: google-gemini-cli`，需要避免错误回退到 OpenAI client 或缺失 credential，并避免配置缺口每 60 秒重复触发压缩 |
 
 包含文件：
 
 - `agent/auxiliary_client.py`
+- `agent/context_compressor.py`
 - `tests/hermes_cli/test_gemini_provider.py`
+- `tests/agent/test_context_compressor.py`
 
 关键行为：
 
@@ -280,6 +284,7 @@ if provider == "google-gemini-cli":
 
 - `resolve_provider_client("google-gemini-cli", model="gemini-3-flash-preview")` 返回 `GeminiCloudCodeClient`。
 - `call_llm(task="compression")` 能按 `~/.hermes/config.yaml` 的 `auxiliary.compression` 路由到 `google-gemini-cli`。
+- `provider ... could not be rebuilt after recovery` 被识别为 auxiliary provider 配置缺口，进入 600 秒 cooldown，而不是 60 秒短暂错误 cooldown。
 - 重启 `hermes-gateway.service` 后日志无新的 auxiliary/compression 报错。
 
 ---
@@ -327,29 +332,11 @@ cd /root/.hermes/hermes-agent
 然后执行：
 
 ```bash
-python3 -m py_compile \
-  cli.py run_agent.py gateway/run.py gateway/slash_commands.py \
-  agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
-  agent/agent_runtime_helpers.py agent/chat_completion_helpers.py \
-  agent/conversation_loop.py agent/auxiliary_client.py \
-  agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
-  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
-  hermes_cli/runtime_provider.py \
-  gateway/platforms/base.py plugins/platforms/telegram/adapter.py
-
-PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
-  tests/cli/test_personality_none.py \
-  tests/hermes_cli/test_user_providers_model_switch.py \
-  tests/hermes_cli/test_models.py \
-  tests/hermes_cli/test_timeouts.py \
-  tests/hermes_cli/test_gemini_provider.py \
-  tests/agent/test_gemini_cloudcode.py \
-  tests/gateway/test_telegram_thread_fallback.py -q
-
-PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
-  tests/run_agent/test_run_agent.py \
-  -k 'kimi_coding_endpoint or kimi_coding_strips or kimi_coding_stripped' -q
+PYTHON_BIN=/root/.hermes/hermes-agent/.venv/bin/python \
+  /root/.hermes/hermes-agent-patches/restore-local-patches.sh
 ```
+
+脚本会从 canonical overlay 的 `diff --git` 头动态提取并编译全部受影响 Python 文件，然后执行 Kimi、Gemini、compression、inventory/provider picker、persona routing、cron scheduler 与 Telegram thread metadata 定向测试；pytest 环境会显式清空 `HERMES_CRON_SESSION`、`HERMES_EXEC_ASK`、`HERMES_GATEWAY_SESSION`。
 
 ### 手动恢复步骤
 
@@ -367,37 +354,8 @@ PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
 ```bash
 # 唯一恢复入口：canonical overlay
 git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/00-current-local-overlay.patch
-
-# 功能级 patch 仅作审计参考，也可反向校验
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/02-gemini-cli-cloudcode-compat.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/03-persona-model-routing.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/04-telegram-model-picker-cleanup.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/05-kimi-fallback-fix.patch
-git apply --reverse --check /root/.hermes/hermes-agent-patches/by-feature/06-gemini-cli-auxiliary-compression.patch
-
-python3 -m py_compile \
-  cli.py run_agent.py gateway/run.py gateway/slash_commands.py \
-  agent/model_metadata.py agent/models_dev.py agent/anthropic_adapter.py \
-  agent/agent_runtime_helpers.py agent/chat_completion_helpers.py \
-  agent/conversation_loop.py agent/auxiliary_client.py \
-  agent/gemini_cloudcode_adapter.py agent/google_oauth.py \
-  hermes_cli/auth.py hermes_cli/model_switch.py hermes_cli/models.py \
-  hermes_cli/runtime_provider.py \
-  gateway/platforms/base.py plugins/platforms/telegram/adapter.py
-
-PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
-  tests/cli/test_personality_none.py \
-  tests/hermes_cli/test_user_providers_model_switch.py \
-  tests/hermes_cli/test_models.py \
-  tests/hermes_cli/test_timeouts.py \
-  tests/hermes_cli/test_gemini_provider.py \
-  tests/agent/test_gemini_cloudcode.py \
-  tests/gateway/test_telegram_thread_fallback.py -q
-
-PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
-  tests/run_agent/test_run_agent.py \
-  -k 'kimi_coding_endpoint or kimi_coding_strips or kimi_coding_stripped' -q
+PYTHON_BIN=/root/.hermes/hermes-agent/.venv/bin/python \
+  /root/.hermes/hermes-agent-patches/restore-local-patches.sh
 ```
 
 ---
@@ -406,6 +364,7 @@ PYTEST_ADDOPTS='' .venv/bin/python -m pytest -o addopts='' \
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-13 | 合并 upstream/main 177 个新 commits；解决 `hermes_cli/inventory.py` 与 `hermes_cli/model_switch.py` 冲突；保留 upstream credential-pool 可用性/用户配置模型逻辑及本地 canonical alias 去重；修复 compression provider rebuild 分类和 Telegram enum forum thread metadata；刷新 canonical overlay 与动态验证脚本 |
 | 2026-07-11 | 受控合并 upstream/main 至 `b8880f124`（416 commits）；正式纳入 GPT-5.6 Sol/Terra/Luna 支持；`test_inventory.py` 唯一冲突通过同时保留本地 Kimi 别名去重测试与 upstream `explicit_only` 测试解决；重新生成 canonical overlay |
 | 2026-07-02 | 上游 sync 至 `upstream/main`（656 commits）；唯一恢复入口改为 `00-current-local-overlay.patch`；刷新 `01-06` 为审计参考；`gateway/platforms/telegram.py` 已随上游迁移至 `plugins/platforms/telegram/adapter.py`；更新 `LOCAL_PATCHES.md` 与 `restore-local-patches.sh` 验证清单 |
 | 2026-06-13 | 将 8 个文件级/功能级 patch 收敛为 `00-current-local-overlay.patch` 作为 canonical overlay |
