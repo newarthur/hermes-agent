@@ -354,7 +354,14 @@ def test_list_authenticated_providers_openai_codex_built_in_nonzero_total(monkey
     )
     monkeypatch.setattr(
         "agent.credential_pool.load_pool",
-        lambda provider: type("MockPool", (), {"has_credentials": lambda self: True})(),
+        lambda provider: type(
+            "MockPool",
+            (),
+            {
+                "has_credentials": lambda self: True,
+                "has_available": lambda self: True,
+            },
+        )(),
     )
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids",

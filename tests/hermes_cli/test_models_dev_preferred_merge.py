@@ -114,8 +114,9 @@ class TestProviderModelIdsPreferred:
             patch("providers.base.ProviderProfile.fetch_models", return_value=["kimi-k2.6"]),
         ):
             out = provider_model_ids("kimi-coding")
-        # Curated-first order; curated newest (k2.7-code) stays ahead of live.
-        assert out[:2] == ["kimi-k2.7-code", "kimi-k2.6"]
+        # Curated-first order; both locally curated K2.7 variants stay ahead
+        # of the older model returned by live discovery.
+        assert out[:3] == ["kimi-k2.7-code", "kimi-k2.7-highspeed", "kimi-k2.6"]
 
     def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
         """The setup wizard must not carry a stale duplicate Kimi model list."""
