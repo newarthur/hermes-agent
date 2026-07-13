@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-07-05
-> 上游合并: 2026-07-05 (`upstream/main` 落后本地 76 commits，merge base 后本地 76 commits 含 merge commit)
+> 最后更新: 2026-07-13
+> 上游合并: 2026-07-13（已合并 `upstream/main`；本地相对上游 81 commits，含本次 merge commit 与本地 patch 历史）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
