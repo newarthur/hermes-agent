@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-07-13
-> 上游合并: 2026-07-13（已合并 `upstream/main`；本地相对上游 81 commits，含本次 merge commit 与本地 patch 历史）
+> 最后更新: 2026-07-16
+> 上游合并: 2026-07-16（已合并 `upstream/main`；本地相对上游 87 commits，含本次 merge commit 与本地 patch 历史；`cli.py` 冲突采用上游的非空 agent 局部引用保护，同时保留本地 persona route 初始化）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
