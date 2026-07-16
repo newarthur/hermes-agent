@@ -58,7 +58,7 @@
 - `hermes_cli/inventory.py`（canonical provider alias 去重，同时保留未认证的当前 provider 行）
 - `hermes_cli/model_switch.py` 中 Kimi `/v1` 剥离逻辑
 - `hermes_cli/runtime_provider.py`
-- `hermes_cli/models.py`（添加 `kimi-k2.7-highspeed` 到 TUI 模型列表）
+- `hermes_cli/models.py`（将 `k3` 置于 Kimi TUI 模型列表首位，并保留旧版 K2.7 兼容项）
 - `agent/anthropic_adapter.py`
 - `agent/agent_runtime_helpers.py`
 - `agent/conversation_loop.py`
@@ -91,7 +91,7 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 - `tests/hermes_cli/test_timeouts.py::test_anthropic_adapter_normalizes_kimi_coding_v1_for_messages_sdk` 通过。
 - Kimi 家族 endpoint 上，包含工具调用的 assistant 历史消息缺少 reasoning 内容时会补空字符串，避免 Kimi 400。
 - 切换到 Kimi Coding 前会在 API-call-time copy 中移除 Anthropic/Codex 历史 `thinking` / `redacted_thinking` content blocks、`reasoning_details`、`anthropic_content_blocks`、`codex_reasoning_items`，避免 `invalid thinking: only type=enabled is allowed for this model`。
-- TUI `/model` 菜单显示 `kimi-k2.7-code` 和 `kimi-k2.7-highspeed`（通过 `hermes_cli/models.py` 的 `_PROVIDER_MODELS["kimi-coding"]` 列表）。
+- TUI `/model` 菜单将 `k3` 作为 Kimi Coding 首选模型；旧版 `kimi-k2.7-code` / `kimi-k2.7-highspeed` 仅保留为兼容选项（通过 `hermes_cli/models.py` 的 `_PROVIDER_MODELS["kimi-coding"]` 列表）。
 
 ---
 

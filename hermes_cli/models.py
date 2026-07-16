@@ -320,6 +320,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimaxai/minimax-m3",
     ],
     "kimi-coding": [
+        "k3",
         "kimi-k2.7-code",
         "kimi-k2.7-highspeed",
         "kimi-k2.6",

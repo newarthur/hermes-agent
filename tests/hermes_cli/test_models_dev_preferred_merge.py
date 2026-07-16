@@ -97,14 +97,14 @@ class TestProviderModelIdsPreferred:
         assert "claude-opus-4-7" in out
         assert "kimi-k2.6" in out
 
-    def test_kimi_coding_offline_catalog_includes_k2_7_code(self):
-        """Native Kimi users must see the newest Code model without live catalog help."""
+    def test_kimi_coding_offline_catalog_includes_k3(self):
+        """Native Kimi users must see K3 without live catalog help."""
         assert "kimi-coding" not in _MODELS_DEV_PREFERRED
         with patch("agent.models_dev.list_agentic_models", return_value=[]):
             out = provider_model_ids("kimi-coding")
-        assert "kimi-k2.7-code" in out
+        assert out[0] == "k3"
 
-    def test_kimi_coding_live_catalog_does_not_hide_curated_k2_7_code(self):
+    def test_kimi_coding_live_catalog_does_not_hide_curated_k3(self):
         """Kimi /models can lag inference; live results must not replace curated."""
         with (
             patch(
@@ -114,9 +114,9 @@ class TestProviderModelIdsPreferred:
             patch("providers.base.ProviderProfile.fetch_models", return_value=["kimi-k2.6"]),
         ):
             out = provider_model_ids("kimi-coding")
-        # Curated-first order; both locally curated K2.7 variants stay ahead
-        # of the older model returned by live discovery.
-        assert out[:3] == ["kimi-k2.7-code", "kimi-k2.7-highspeed", "kimi-k2.6"]
+        # Curated-first order; K3 and both locally curated K2.7 variants stay
+        # ahead of the older model returned by live discovery.
+        assert out[:3] == ["k3", "kimi-k2.7-code", "kimi-k2.7-highspeed"]
 
     def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
         """The setup wizard must not carry a stale duplicate Kimi model list."""
@@ -137,7 +137,7 @@ class TestProviderModelIdsPreferred:
             _model_flow_kimi({}, current_model="")
 
         assert captured["models"] == _PROVIDER_MODELS["kimi-coding"]
-        assert captured["models"][0] == "kimi-k2.7-code"
+        assert captured["models"][0] == "k3"
 
 
 class TestOpenRouterAndNousUnchanged:
