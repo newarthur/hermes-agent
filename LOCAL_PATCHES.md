@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-07-16
-> 上游合并: 2026-07-16（已合并 `upstream/main`；本地相对上游 87 commits，含本次 merge commit 与本地 patch 历史；`cli.py` 冲突采用上游的非空 agent 局部引用保护，同时保留本地 persona route 初始化）
+> 最后更新: 2026-07-21
+> 上游合并: 2026-07-21（已合并 `upstream/main` 的 941 个新 commits；本地相对上游 90 commits，含本次 merge commit 与本地 patch 历史；`hermes_cli/model_switch.py` 合并 canonical alias 去重与上游 provider enabled/raw-name 去重，`hermes_cli/models.py` 保留 Kimi Coding Plan 的真实模型 ID `k3`，并将 `k3` 严格限制在官方 Coding endpoint；相应测试同时保留上游 endpoint-scope 覆盖与本地 K3-first 策略）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
@@ -49,7 +49,7 @@
 | 文件位置 | `/root/.hermes/hermes-agent-patches/by-feature/01-kimi-coding-plan-runtime.patch` |
 | 优先级 | critical |
 | 修改类型 | Kimi Coding Plan endpoint、api_mode、runtime、Anthropic SDK URL 归一化、Kimi tool-call reasoning/content padding、跨 provider thinking block 清洗 |
-| 上游冲突 | 上游可能恢复 Moonshot endpoint、缺少 Kimi Coding 双端点处理，或继续向 Kimi replay Anthropic/Codex `thinking` content blocks |
+| 上游冲突 | 上游可能恢复 Moonshot endpoint、将 Kimi Coding Plan 的真实模型 ID `k3` 误写为 `kimi-k3`、缺少 Kimi Coding 双端点处理，或继续向 Kimi replay Anthropic/Codex `thinking` content blocks |
 | 保留理由 | 防止 Kimi Coding 路由回退、stale `chat_completions` 覆盖、`/coding/v1/v1/messages` 404、跨 Provider 降级到 Kimi 时 tool-call 历史消息 HTTP 400，以及从 Codex/Anthropic 长会话切到 Kimi 时 `invalid thinking` 400 |
 
 包含文件：
@@ -92,6 +92,7 @@ if normalized_base_url.rstrip("/").lower() == "https://api.kimi.com/coding/v1":
 - Kimi 家族 endpoint 上，包含工具调用的 assistant 历史消息缺少 reasoning 内容时会补空字符串，避免 Kimi 400。
 - 切换到 Kimi Coding 前会在 API-call-time copy 中移除 Anthropic/Codex 历史 `thinking` / `redacted_thinking` content blocks、`reasoning_details`、`anthropic_content_blocks`、`codex_reasoning_items`，避免 `invalid thinking: only type=enabled is allowed for this model`。
 - TUI `/model` 菜单将 `k3` 作为 Kimi Coding 首选模型；旧版 `kimi-k2.7-code` / `kimi-k2.7-highspeed` 仅保留为兼容选项（通过 `hermes_cli/models.py` 的 `_PROVIDER_MODELS["kimi-coding"]` 列表）。
+- 只有 `https://api.kimi.com/coding[/v1]` 会在带凭据的动态目录中保留 `k3`；legacy Moonshot 与任意自定义 endpoint 即使返回同名模型也会过滤，避免把 Coding Plan 模型错误暴露给不兼容端点。
 
 ---
 
