@@ -98,18 +98,19 @@ class TestProviderModelIdsPreferred:
         assert "kimi-k2.6" in out
 
     def test_kimi_coding_offline_catalog_includes_k3(self):
-        """Native Kimi users must see K3 without live catalog help."""
+        """Native Kimi users must see the newest models without live catalog help."""
         assert "kimi-coding" not in _MODELS_DEV_PREFERRED
         with patch("agent.models_dev.list_agentic_models", return_value=[]):
             out = provider_model_ids("kimi-coding")
         assert out[0] == "k3"
+        assert "kimi-k2.7-code" in out
 
     def test_kimi_coding_live_catalog_does_not_hide_curated_k3(self):
         """Kimi /models can lag inference; live results must not replace curated."""
         with (
             patch(
                 "hermes_cli.auth.resolve_api_key_provider_credentials",
-                return_value={"api_key": "sk-test", "base_url": "https://api.moonshot.ai/v1"},
+                return_value={"api_key": "sk-test", "base_url": "https://api.kimi.com/coding"},
             ),
             patch("providers.base.ProviderProfile.fetch_models", return_value=["kimi-k2.6"]),
         ):
@@ -117,6 +118,64 @@ class TestProviderModelIdsPreferred:
         # Curated-first order; K3 and both locally curated K2.7 variants stay
         # ahead of the older model returned by live discovery.
         assert out[:3] == ["k3", "kimi-k2.7-code", "kimi-k2.7-highspeed"]
+
+    def test_k3_live_discovery_is_scoped_to_kimi_coding_endpoint(self):
+        """Coding keys discover K3; legacy Moonshot keys must not advertise it."""
+
+        class Response:
+            def __init__(self, body: bytes):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_open(req, **_kwargs):
+            if req.full_url == "https://api.kimi.com/coding/v1/models":
+                return Response(b'{"data":[{"id":"k3"}]}')
+            if req.full_url == "https://api.moonshot.ai/v1/models":
+                return Response(b'{"data":[{"id":"K3"},{"id":"kimi-k2.6"}]}')
+            if req.full_url == "https://example.invalid/v1/models":
+                return Response(b'{"data":[{"id":"k3"},{"id":"kimi-k2.6"}]}')
+            raise AssertionError(f"unexpected Kimi models URL: {req.full_url}")
+
+        with patch("hermes_cli.urllib_security.open_credentialed_url", side_effect=fake_open):
+            with patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                return_value={
+                    "api_key": "sk-kimi-test",
+                    "base_url": "https://api.kimi.com/coding",
+                },
+            ):
+                coding_models = provider_model_ids("kimi-coding")
+
+            with patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                return_value={
+                    "api_key": "legacy-test",
+                    "base_url": "https://api.moonshot.ai/v1",
+                },
+            ):
+                legacy_models = provider_model_ids("kimi-coding")
+
+            with patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                return_value={
+                    "api_key": "custom-test",
+                    "base_url": "https://example.invalid/v1",
+                },
+            ):
+                custom_models = provider_model_ids("kimi-coding")
+
+        assert "k3" in coding_models
+        assert coding_models[0] == "k3"
+        assert all(model.lower() != "k3" for model in legacy_models)
+        assert all(model.lower() != "k3" for model in custom_models)
 
     def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
         """The setup wizard must not carry a stale duplicate Kimi model list."""
