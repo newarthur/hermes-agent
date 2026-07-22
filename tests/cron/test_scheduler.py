@@ -516,6 +516,7 @@ class TestRoutingIntents:
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
                     "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")  # stub: photon home falls back to ~/.hermes/.env, beyond delenv reach
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
@@ -556,6 +557,7 @@ class TestRoutingIntents:
             "WHATSAPP_HOME_CHANNEL",
         ):
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")  # stub: photon home falls back to ~/.hermes/.env, beyond delenv reach
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
