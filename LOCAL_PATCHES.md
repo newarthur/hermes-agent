@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-07-21
-> 上游合并: 2026-07-21（已合并 `upstream/main` 的 941 个新 commits；本地相对上游 90 commits，含本次 merge commit 与本地 patch 历史；`hermes_cli/model_switch.py` 合并 canonical alias 去重与上游 provider enabled/raw-name 去重，`hermes_cli/models.py` 保留 Kimi Coding Plan 的真实模型 ID `k3`，并将 `k3` 严格限制在官方 Coding endpoint；相应测试同时保留上游 endpoint-scope 覆盖与本地 K3-first 策略）
+> 最后更新: 2026-07-27
+> 上游合并: 2026-07-27（已合并 `upstream/main` 的 1285 个新 commits；本地相对上游 94 commits，含本次 merge commit 与本地 patch 历史；`cli.py` 采用上游 500 次默认迭代上限和 deferred tool catalog 展示逻辑；`tests/hermes_cli/test_models_dev_preferred_merge.py` 继续要求 Kimi Coding Plan 使用真实 wire ID `k3`，同时保留 legacy/custom endpoint 隔离断言）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
@@ -365,6 +365,7 @@ PYTHON_BIN=/root/.hermes/hermes-agent/.venv/bin/python \
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-27 | 合并 `upstream/main` 1285 个新 commits；解决 `cli.py` 与 `tests/hermes_cli/test_models_dev_preferred_merge.py` 冲突；保留上游 CLI 迭代/tool discovery 改进及本地 Kimi Coding Plan `k3` wire-ID 策略，并重新生成 canonical overlay |
 | 2026-07-13 | 合并 upstream/main 177 个新 commits；解决 `hermes_cli/inventory.py` 与 `hermes_cli/model_switch.py` 冲突；保留 upstream credential-pool 可用性/用户配置模型逻辑及本地 canonical alias 去重；修复 compression provider rebuild 分类和 Telegram enum forum thread metadata；刷新 canonical overlay 与动态验证脚本 |
 | 2026-07-11 | 受控合并 upstream/main 至 `b8880f124`（416 commits）；正式纳入 GPT-5.6 Sol/Terra/Luna 支持；`test_inventory.py` 唯一冲突通过同时保留本地 Kimi 别名去重测试与 upstream `explicit_only` 测试解决；重新生成 canonical overlay |
 | 2026-07-02 | 上游 sync 至 `upstream/main`（656 commits）；唯一恢复入口改为 `00-current-local-overlay.patch`；刷新 `01-06` 为审计参考；`gateway/platforms/telegram.py` 已随上游迁移至 `plugins/platforms/telegram/adapter.py`；更新 `LOCAL_PATCHES.md` 与 `restore-local-patches.sh` 验证清单 |
