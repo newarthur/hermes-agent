@@ -38,6 +38,7 @@ For captures / actions with `capture_after=True`:
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import logging
@@ -138,6 +139,8 @@ def _is_blocked_type(text: str) -> Optional[str]:
 
 # Per-process cached backend; lazily instantiated on first call.
 _backend_lock = threading.Lock()
+# Process-scoped aux-vision routing cache: (provider, model) → bool.
+_AUX_VISION_ROUTE_CACHE: Dict[Tuple[str, str], bool] = {}
 _backend: Optional[ComputerUseBackend] = None
 # Approval state, scoped per conversation/run (keyed by session_id) so a
 # gateway serving concurrent sessions can't leak one run's "always approve"
@@ -175,16 +178,40 @@ def _get_backend() -> ComputerUseBackend:
         return _backend
 
 
+def _shutdown_backend_atexit() -> None:
+    """Stop the cached backend so the cua-driver child doesn't outlive us.
+
+    The backend is cached per-process and holds a long-lived ``cua-driver``
+    subprocess, so without this the driver survives the Hermes process that
+    spawned it (#28152 item 3). #69903 kept the orphan from burning a core by
+    disabling the cursor overlay; the process itself still lingered.
+
+    Mirrors ``browser_tool``'s ``atexit.register(_emergency_cleanup_all_sessions)``
+    — same spawn-and-drive-a-subprocess shape. atexit only, no signal handlers:
+    a ``SystemExit`` raised from a prompt_toolkit key binding corrupts its
+    coroutine state and makes the process unkillable. Never raises, since an
+    exception escaping atexit prints a traceback on every exit.
+    """
+    global _backend
+    # Drop the lock before stop() — teardown budgets 5s and shouldn't block
+    # an unrelated caller waiting to spawn.
+    with _backend_lock:
+        backend, _backend = _backend, None
+    if backend is None:
+        return
+    try:
+        backend.stop()
+    except Exception as e:
+        logger.debug("cua-driver atexit teardown failed: %s", e)
+
+
+atexit.register(_shutdown_backend_atexit)
+
+
 def reset_backend_for_tests() -> None:  # pragma: no cover
     """Test helper — tear down the cached backend and per-session state."""
-    global _backend
-    with _backend_lock:
-        if _backend is not None:
-            try:
-                _backend.stop()
-            except Exception:
-                pass
-        _backend = None
+    _shutdown_backend_atexit()
+    _AUX_VISION_ROUTE_CACHE.clear()
     with _approval_lock:
         _session_auto_approve.clear()
         _always_allow.clear()
@@ -792,17 +819,37 @@ def _should_route_through_aux_vision() -> bool:
         logger.debug("computer_use: aux-vision routing import failed: %s", exc)
         return False
     try:
-        provider = _read_main_provider()
-        model = _read_main_model()
-        cfg = load_config()
+        provider = _read_main_provider() or ""
+        model = _read_main_model() or ""
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing config read failed: %s", exc)
         return False
+    cache_key = (str(provider), str(model))
+    cached = _AUX_VISION_ROUTE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        return bool(should_route_capture_to_aux_vision(provider, model, cfg))
+        cfg = load_config()
+        decision = bool(should_route_capture_to_aux_vision(provider, model, cfg))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("computer_use: aux-vision routing decision failed: %s", exc)
         return False
+    _AUX_VISION_ROUTE_CACHE[cache_key] = decision
+    return decision
+
+
+def _capture_after_mode() -> str:
+    """Mode for ``capture_after`` follow-ups. Default ``som`` (screenshot)."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config() or {}).get("computer_use") or {}).get(
+            "capture_after_mode", "som"
+        )
+    except Exception:
+        return "som"
+    mode = str(raw or "som").strip().lower()
+    return mode if mode in {"som", "vision", "ax"} else "som"
 
 
 def _route_capture_through_aux_vision(
@@ -927,10 +974,11 @@ def _maybe_follow_capture(
         target = getattr(backend, "_last_target", None) or {}
         pid = target.get("pid")
         window_id = target.get("window_id")
+        mode = _capture_after_mode()
         if pid is not None and window_id is not None:
-            cap = backend.capture(mode="som", pid=pid, window_id=window_id)
+            cap = backend.capture(mode=mode, pid=pid, window_id=window_id)
         else:
-            cap = backend.capture(mode="som", app=getattr(backend, "_last_app", None))
+            cap = backend.capture(mode=mode, app=getattr(backend, "_last_app", None))
     except Exception as e:
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)

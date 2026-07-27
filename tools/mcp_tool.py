@@ -93,6 +93,7 @@ import asyncio
 import contextvars
 import concurrent.futures
 import errno
+import fnmatch
 import inspect
 import json
 import logging
@@ -2353,10 +2354,8 @@ class MCPServerTask:
         if not _MCP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
-                "it is not installed. Install with:\n"
-                "  pip install 'hermes-agent[mcp]'\n"
-                "or (full install):\n"
-                "  pip install 'hermes-agent[all]'"
+                "it is not installed. Run `hermes setup` to install MCP support, "
+                "then retry."
             )
 
         command = config.get("command")
@@ -2413,6 +2412,10 @@ class MCPServerTask:
             command=command,
             args=args,
             env=safe_env if safe_env else None,
+            # On Windows, pipe I/O can deliver non-UTF-8 bytes at chunk
+            # boundaries.  Use "replace" to substitute undecodable bytes
+            # with U+FFFD instead of crashing with UnicodeDecodeError.
+            encoding_error_handler="replace",
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -5305,7 +5308,12 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
 
 
 def _normalize_name_filter(value: Any, label: str) -> set[str]:
-    """Normalize include/exclude config to a set of tool names."""
+    """Normalize include/exclude config to a set of tool-name patterns.
+
+    Entries may be exact tool names or fnmatch-style globs
+    (``*_radar_*``, ``get_zones_*``). Matching happens in
+    :func:`matches_name_filter`.
+    """
     if value is None:
         return set()
     if isinstance(value, str):
@@ -5314,6 +5322,25 @@ def _normalize_name_filter(value: Any, label: str) -> set[str]:
         return {str(item) for item in value}
     logger.warning("MCP config %s must be a string or list of strings; ignoring %r", label, value)
     return set()
+
+
+def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
+    """True if ``tool_name`` matches any entry in ``patterns``.
+
+    Exact names match literally; entries containing fnmatch metacharacters
+    (``*``, ``?``, ``[``) match as case-sensitive globs — the same pattern
+    semantics as ``approvals.deny``. Exact membership is checked first so
+    large literal lists stay O(1).
+    """
+    if not patterns:
+        return False
+    if tool_name in patterns:
+        return True
+    return any(
+        fnmatch.fnmatchcase(tool_name, p)
+        for p in patterns
+        if "*" in p or "?" in p or "[" in p
+    )
 
 
 def _parse_boolish(value: Any, default: bool = True) -> bool:
@@ -5479,9 +5506,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     toolset_name = f"mcp-{name}"
 
     # Selective tool loading: honour include/exclude lists from config.
-    # Rules (matching issue #690 spec):
-    #   tools.include — whitelist: only these tool names are registered
-    #   tools.exclude — blacklist: all tools EXCEPT these are registered
+    # Rules (matching issue #690 spec, extended with glob support):
+    #   tools.include — whitelist: only matching tool names are registered
+    #   tools.exclude — blacklist: all tools EXCEPT matching ones are registered
+    #   entries may be exact names or fnmatch globs (e.g. "*_radar_*")
     #   include takes precedence over exclude
     #   Neither set → register all tools (backward-compatible default)
     tools_filter = config.get("tools") or {}
@@ -5490,9 +5518,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
-            return tool_name in include_set
+            return matches_name_filter(tool_name, include_set)
         if exclude_set:
-            return tool_name not in exclude_set
+            return not matches_name_filter(tool_name, exclude_set)
         return True
 
     for mcp_tool in server._tools:
@@ -5971,6 +5999,21 @@ def has_registered_mcp_tools() -> bool:
         return bool(_mcp_tool_server_names)
 
 
+def get_registered_mcp_server_names() -> set:
+    """Return the set of MCP server names that have actually registered at
+    least one tool into the registry (post-connection, post check_fn/include-
+    exclude filtering) -- i.e. the real, availability-filtered signal, not
+    just what's present in config.yaml under ``mcp_servers``.
+
+    Used by capability-aware prompt building (e.g. gateway/session.py's
+    Slack platform note) to detect an MCP server that provides a given
+    platform's capability regardless of what its config key is named.
+    """
+    with _lock:
+        return set(_mcp_tool_server_names.values())
+
+
+
 def refresh_agent_mcp_tools(
     agent,
     *,
@@ -6121,9 +6164,13 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         memory_manager = getattr(agent, "_memory_manager", None)
         get_mem_schemas = getattr(memory_manager, "get_all_tool_schemas", None) if memory_manager else None
         if callable(get_mem_schemas):
-            # Honor the same enablement gate inject_memory_provider_tools uses.
+            # Honor the same toolset gate inject_memory_provider_tools uses.
             from agent.memory_manager import memory_provider_tools_enabled
-            if "memory" in name_set or memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None)):
+            if memory_provider_tools_enabled(
+                getattr(agent, "enabled_toolsets", None),
+                getattr(agent, "disabled_toolsets", None),
+                memory_tool_present="memory" in name_set,
+            ):
                 for schema in get_mem_schemas():
                     if isinstance(schema, dict):
                         _add(schema)

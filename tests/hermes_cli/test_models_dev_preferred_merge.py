@@ -172,10 +172,14 @@ class TestProviderModelIdsPreferred:
             ):
                 custom_models = provider_model_ids("kimi-coding")
 
+        # Kimi Coding Plan's canonical endpoint uses the literal wire ID
+        # ``k3``. Keep that ID first instead of rewriting it to ``kimi-k3``.
         assert "k3" in coding_models
         assert coding_models[0] == "k3"
         assert all(model.lower() != "k3" for model in legacy_models)
         assert all(model.lower() != "k3" for model in custom_models)
+        # Legacy / custom endpoints never advertise the k3 family at all
+        # through either live discovery or the locally curated floor.
 
     def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
         """The setup wizard must not carry a stale duplicate Kimi model list."""

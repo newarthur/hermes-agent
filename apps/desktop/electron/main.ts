@@ -14,6 +14,7 @@ import {
   clipboard,
   dialog,
   net as electronNet,
+  globalShortcut,
   ipcMain,
   Menu,
   nativeImage,
@@ -30,13 +31,15 @@ import {
 } from 'electron'
 import nodePty from 'node-pty'
 
+import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
-import { canImportHermesCli, verifyHermesCli } from './backend-probes'
+import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { shouldLatchBackendStartFailure } from './backend-start-failure'
+import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -78,21 +81,11 @@ import {
 } from './desktop-uninstall'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { findGitBash as _findGitBash } from './find-git-bash'
+import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
+import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
-import { runNativeLogin } from './native-oauth-login'
-import {
-  nativeRefreshUrl,
-  parseTokenResponse,
-  resolveLoginStrategy,
-  tokenNeedsRefresh,
-  type NativeTokenSet
-} from './native-oauth'
-import {
-  oauthSessionIsLive,
-  resolveJsonBody,
-  resolveOauthRestAuth
-} from './native-auth-decisions'
 import { scanGitRepos } from './git-repo-scan'
 import {
   fileDiffVsHead,
@@ -129,9 +122,27 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import {
+  oauthGuardMayHardFail,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
+import {
+  nativeRefreshUrl,
+  type NativeTokenSet,
+  parseTokenResponse,
+  resolveLoginStrategy,
+  tokenNeedsRefresh
+} from './native-oauth'
+import { runNativeLogin } from './native-oauth-login'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
+import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
+import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import * as remoteLifecycle from './remote-lifecycle'
 import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
 import {
@@ -366,9 +377,9 @@ if (IS_WINDOWS) {
 ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 
 // Keep the renderer running at full speed while the window is in the background
-// or occluded. The chat transcript streams to screen through a
-// requestAnimationFrame-gated flush; Chromium pauses rAF (and clamps timers)
-// for backgrounded/occluded renderers, so without these the live answer stalls
+// or occluded. The chat transcript streams to screen through a bounded timer
+// flush; Chromium clamps timers for backgrounded/occluded renderers, so without
+// these the live answer stalls
 // whenever the window loses focus (switching to your editor mid-turn, detached
 // devtools, another window covering it) and only paints on refocus or refresh.
 // `backgroundThrottling: false` on the BrowserWindow covers the blurred case;
@@ -1015,9 +1026,22 @@ let bootstrapFailure = null
 // Latched non-bootstrap backend spawn failure — stops getConnection() from
 // respawning hermes serve backend children in a tight loop while boot is broken.
 let backendStartFailure = null
+// Latched CONFIRMED remote reauth failure. Remote failures deliberately do not
+// latch via backendStartFailure (they're usually transient and must stay
+// retryable), but a rejected session cannot self-heal — and the non-latching
+// path actively breaks recovery: each retry re-emits running:true and hides
+// the boot-failure overlay, so the "Sign in" button flickers away before it
+// can be clicked. Cleared on every recovery path and on a confirmed sign-in.
+let remoteReauthFailure = null
 // Active first-launch install, so the renderer's Cancel button (and app quit)
 // can abort the in-flight install.sh/ps1 instead of leaving it running.
 let bootstrapAbortController = null
+// Explicit "the user asked for a repair" flag. Repair used to signal intent by
+// deleting the bootstrap marker, which stranded healthy installs whose only
+// problem was a transient backend error (#72166). Intent now lives here, so
+// repair can force the installer without destroying provenance about how the
+// install was created. Cleared once the reinstall is under way.
+let bootstrapRepairRequested = false
 let connectionConfigCache = null
 let connectionConfigCacheMtime = null
 const hermesLog = []
@@ -1402,13 +1426,17 @@ let bootstrapState = {
   log: [],
   startedAt: null,
   completedAt: null,
+  setupChoice: null,
   unsupportedPlatform: null
 }
+
+let firstRunSetupGate = null
 
 function broadcastBootstrapEvent(ev) {
   if (ev.type === 'manifest') {
     bootstrapState.manifest = ev
     bootstrapState.active = true
+    bootstrapState.setupChoice = null
     bootstrapState.startedAt = bootstrapState.startedAt || Date.now()
     bootstrapState.stages = {}
 
@@ -1436,14 +1464,30 @@ function broadcastBootstrapEvent(ev) {
   } else if (ev.type === 'failed') {
     bootstrapState.active = false
     bootstrapState.error = ev.error || 'unknown error'
+    bootstrapState.setupChoice = null
   } else if (ev.type === 'unsupported-platform') {
     bootstrapState.active = false
+    bootstrapState.setupChoice = null
     bootstrapState.unsupportedPlatform = {
       platform: ev.platform,
       activeRoot: ev.activeRoot,
       installCommand: ev.installCommand,
       docsUrl: ev.docsUrl
     }
+  } else if (ev.type === 'setup-choice') {
+    bootstrapState.active = false
+    bootstrapState.error = null
+    bootstrapState.manifest = null
+    bootstrapState.stages = {}
+    bootstrapState.setupChoice = ev.active
+      ? {
+          platform: ev.platform,
+          activeRoot: ev.activeRoot
+        }
+      : null
+    bootstrapState.unsupportedPlatform = null
+  } else if (ev.type === 'dismissed') {
+    resetBootstrapSnapshot()
   }
 
   if (!mainWindow || mainWindow.isDestroyed()) {
@@ -1461,6 +1505,100 @@ function broadcastBootstrapEvent(ev) {
 
 function getBootstrapState() {
   return bootstrapState
+}
+
+function resetBootstrapSnapshot() {
+  bootstrapState = {
+    active: false,
+    manifest: null,
+    stages: {},
+    error: null,
+    log: [],
+    startedAt: null,
+    completedAt: null,
+    setupChoice: null,
+    unsupportedPlatform: null
+  }
+}
+
+function promptFirstRunSetupChoice(backend) {
+  broadcastBootstrapEvent({
+    type: 'setup-choice',
+    active: true,
+    platform: backend.platform || process.platform,
+    activeRoot: backend.activeRoot || ACTIVE_HERMES_ROOT
+  })
+}
+
+function hideFirstRunSetupChoice() {
+  if (bootstrapState.setupChoice) {
+    broadcastBootstrapEvent({ type: 'setup-choice', active: false })
+  }
+}
+
+function getFirstRunSetupGate() {
+  if (!firstRunSetupGate) {
+    firstRunSetupGate = createFirstRunSetupGate({
+      hideChoice: hideFirstRunSetupChoice,
+      log: rememberLog,
+      onStuck: (_backend, stuckAfterMs) => {
+        updateBootProgress(
+          {
+            error: null,
+            message: `Still waiting for first-run setup choice after ${Math.round(stuckAfterMs / 1000)} seconds`,
+            phase: 'bootstrap.choice',
+            progress: 12,
+            running: true
+          },
+          { allowDecrease: true }
+        )
+      },
+      promptChoice: promptFirstRunSetupChoice
+    })
+  }
+
+  return firstRunSetupGate
+}
+
+async function waitForFirstRunSetupChoice(backend) {
+  const gate = getFirstRunSetupGate()
+
+  if (!gate.shouldGate(backend)) {
+    return 'continue-local'
+  }
+
+  updateBootProgress(
+    {
+      error: null,
+      message: 'Waiting for first-run setup choice',
+      phase: 'bootstrap.choice',
+      progress: 12,
+      running: true
+    },
+    { allowDecrease: true }
+  )
+
+  return gate.wait(backend)
+}
+
+function continueFirstRunLocalBootstrap() {
+  getFirstRunSetupGate().continueLocal()
+}
+
+function abandonFirstRunSetupChoiceForRemoteApply() {
+  const gate = getFirstRunSetupGate()
+
+  if (!gate.hasWaiter()) {
+    return false
+  }
+
+  const resumedGatedConnection = gate.abandonForRemoteApply()
+
+  if (resumedGatedConnection) {
+    broadcastBootstrapEvent({ type: 'dismissed' })
+  }
+
+  return resumedGatedConnection
 }
 
 function updateBootProgress(update, options: { allowDecrease?: boolean } = {}) {
@@ -1919,48 +2057,16 @@ function findSystemPython() {
   return null
 }
 
-// findGitBash — locate bash.exe on Windows. Hermes' terminal tool requires
-// bash (POSIX shell), and on Windows that's almost always Git for Windows'
-// bundled Git Bash. We check the same set of locations tools/environments/
-// local.py:_find_bash() checks at runtime, so a positive result here means
-// the agent will be able to start a terminal too.
-//
-// On non-Windows hosts bash is part of the OS and this just returns the
-// first bash on PATH.
+// findGitBash — locate bash.exe on Windows. Resolves HERMES_GIT_BASH_PATH
+// first (mirrors tools/environments/local.py:_find_bash), then PortableGit,
+// standard install locations, and finally PATH.
 function findGitBash() {
-  if (!IS_WINDOWS) {
-    return findOnPath('bash')
-  }
-
-  // install.ps1 drops PortableGit at %LOCALAPPDATA%\hermes\git\... — checked
-  // first so users who installed via install.ps1 are detected before we
-  // start probing system-wide locations.
-  const localAppData = process.env.LOCALAPPDATA || ''
-  const candidates = []
-
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'bash.exe'))
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'usr', 'bin', 'bash.exe'))
-  }
-
-  // Standard Git for Windows install locations.
-  candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'))
-  candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'))
-
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'Programs', 'Git', 'bin', 'bash.exe'))
-  }
-
-  for (const candidate of candidates) {
-    if (fileExists(candidate)) {
-      return candidate
-    }
-  }
-
-  // Last resort — bash on PATH (covers WSL bash, MSYS2, custom installs).
-  // On WSL hosts findOnPath itself filters out Windows-binary paths via
-  // isWindowsBinaryPathInWsl, so we won't hand back a wsl.exe shim either.
-  return findOnPath('bash')
+  return _findGitBash({
+    isWindows: IS_WINDOWS,
+    env: process.env,
+    fileExists,
+    findOnPath
+  })
 }
 
 function getVenvPython(venvRoot) {
@@ -2690,6 +2796,11 @@ async function applyUpdates(opts = {}) {
 
     const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
 
+    // ── Pre-flight state.db integrity guard (#68474) ─────────────────
+    // Emergency backup and header verification before the update touches
+    // anything.  Runs while the backend is still alive.
+    preflightStateDb(HERMES_HOME, rememberLog)
+
     // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
     // spawn the updater. Without this the updater races a still-locked
     // hermes.exe (held by the backend child / its grandchildren) and the update
@@ -2887,6 +2998,92 @@ function runningAppBundle() {
   return dir.endsWith('.app') ? dir : null
 }
 
+// ── Pre-flight state.db integrity guard (#68474) ─────────────────────
+// Take an emergency snapshot of state.db and verify the live copy is
+// intact before any update process mutates the install.  Runs in the
+// desktop Electron process itself, before the backend is killed and
+// before the updater is spawned — a separate safety net from the
+// Python-level pre-update snapshot inside `hermes update`.
+function preflightStateDb(hermesHome, rememberLog) {
+  const stateDbPath = path.join(hermesHome, 'state.db')
+
+  if (!fileExists(stateDbPath)) {
+    rememberLog('[updates] state.db pre-flight: not found (fresh install?)')
+
+    return
+  }
+
+  try {
+    const stat = fs.statSync(stateDbPath)
+
+    if (stat.size > 100) {
+      const fd = fs.openSync(stateDbPath, 'r')
+      const header = Buffer.alloc(16)
+
+      fs.readSync(fd, header, 0, 16, 0)
+      fs.closeSync(fd)
+
+      const expectedHeader = Buffer.from('SQLite format 3\0')
+      const headerOk = header.equals(expectedHeader)
+
+      rememberLog(
+        `[updates] state.db pre-flight: size=${stat.size}, ` +
+          `headerOk=${headerOk}, headerHex=${header.toString('hex')}`
+      )
+
+      if (!headerOk) {
+        rememberLog(
+          '[updates] state.db header is INVALID before update — ' +
+            'this indicates pre-existing corruption or a concurrent write issue'
+        )
+      }
+
+      // Emergency timestamped backup, separate from the Python-level snapshot.
+      const ts = new Date().toISOString().replace(/[:.]/g, '-')
+
+      const emergencyPath = path.join(hermesHome, `state.db.pre-update-emergency-${ts}.bak`)
+
+      try {
+        fs.copyFileSync(stateDbPath, emergencyPath)
+        const emergStat = fs.statSync(emergencyPath)
+
+        rememberLog(`[updates] emergency state.db backup: ${emergencyPath} ` + `(${emergStat.size} bytes)`)
+
+        // Prune to the 2 most recent emergency backups.
+        try {
+          const homeDir = fs.readdirSync(hermesHome)
+
+          const backups = homeDir
+            .filter(
+              f =>
+                f.startsWith('state.db.pre-update-emergency-') &&
+                f.endsWith('.bak') &&
+                f !== path.basename(emergencyPath)
+            )
+            .sort()
+            .reverse()
+
+          for (const old of backups.slice(2)) {
+            try {
+              fs.unlinkSync(path.join(hermesHome, old))
+            } catch {
+              void 0
+            }
+          }
+        } catch {
+          void 0
+        }
+      } catch (copyErr) {
+        rememberLog(`[updates] emergency state.db backup failed: ${copyErr.message}`)
+      }
+    } else {
+      rememberLog(`[updates] state.db too small (${stat.size} bytes) for a valid SQLite database`)
+    }
+  } catch (statErr) {
+    rememberLog(`[updates] could not stat state.db before update: ${statErr.message}`)
+  }
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
@@ -2905,9 +3102,12 @@ async function applyUpdatesPosixInApp(opts: any) {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
+  // ── Pre-flight state.db integrity guard (#68474) ──
+  preflightStateDb(HERMES_HOME, rememberLog)
+
   // Put the Hermes-managed Node and the venv on PATH so `hermes desktop`'s
   // npm build can find them on a machine with no system Node. Windows portable
-  // Node lives directly under %LOCALAPPDATA%\hermes\node, not node\bin.
+  // Node lives directly under %LOCALAPPDATA%\\hermes\\node, not node\\bin.
   // PYTHONUNBUFFERED: `hermes update` writes to a pipe here, so CPython
   // block-buffers stdout and long quiet steps (the pre-update backup can zip
   // multi-GB archives for minutes) stream nothing to the progress UI — users
@@ -3193,11 +3393,11 @@ function readJson(filePath) {
   }
 }
 
-// Bootstrap-complete marker helpers. The marker is written ONCE by the
-// first-launch bootstrap runner (Phase 1D) after install.ps1 stages succeed
-// AND the user has finished initial configuration. On every subsequent boot
-// we check `isBootstrapComplete()` and skip the bootstrap flow entirely if
-// the marker is present and current-schema.
+// Bootstrap-complete marker helpers. The marker is written by whichever
+// installer ran: install.ps1, install.sh, the Rust bootstrap installer, or the
+// first-launch bootstrap runner. It is provenance ("a bootstrap finished
+// here"), NOT the launch gate -- activeRuntimeState() decides that, because a
+// healthy runtime can predate the marker or outlive a repair that cleared it.
 //
 // Marker schema (version 1):
 //   {
@@ -3230,29 +3430,13 @@ function isActiveRuntimeUsable() {
   )
 }
 
-function isBootstrapComplete() {
-  const marker = readBootstrapMarker()
-
-  if (!marker || typeof marker !== 'object') {
-    return false
-  }
-
-  if (marker.schemaVersion !== BOOTSTRAP_MARKER_SCHEMA_VERSION) {
-    return false
-  }
-
-  if (typeof marker.pinnedCommit !== 'string' || marker.pinnedCommit.length < 7) {
-    return false
-  }
-
+function activeRuntimeState() {
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
-  // update`, which moves HEAD legitimately. The marker just attests "we
-  // ran the bootstrap successfully at least once." We DO additionally require
-  // a runnable venv: an interrupted or split-home install can leave the marker
-  // + checkout without a venv, and trusting that spawns a dead backend
-  // ("gateway offline") instead of re-running bootstrap to repair it.
-  return isActiveRuntimeUsable()
+  // update`, which moves HEAD legitimately. The marker only attests "a
+  // desktop-managed bootstrap ran here at least once"; runtime usability is
+  // what decides whether we can actually launch.
+  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, isActiveRuntimeUsable())
 }
 
 function writeBootstrapMarker(payload) {
@@ -3512,14 +3696,28 @@ function resolveHermesBackend(backendArgs) {
     }
   }
 
-  // 3. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
-  //    %LOCALAPPDATA%\hermes\hermes-agent (Windows) or ~/.hermes/hermes-agent.
-  //    The bootstrap marker means install.ps1 stages finished and the user
-  //    completed initial configuration; we trust the install and go straight
-  //    to spawning hermes. Updates flow through the in-app update path
-  //    (applyUpdates -> git pull) or `hermes update` from the CLI.
-  if (isBootstrapComplete()) {
+  // 3. ACTIVE_HERMES_ROOT — the canonical install at
+  //    %LOCALAPPDATA%\\hermes\\hermes-agent (Windows) or ~/.hermes/hermes-agent.
+  //    A valid bootstrap marker proves Desktop finished the first-run install
+  //    flow, but marker provenance is NOT the same thing as runtime usability:
+  //    the CLI can create the exact same repo+venv layout, and older desktop
+  //    builds could leave a healthy install behind without the marker. If the
+  //    active runtime is usable, launch it directly; only fall through to
+  //    bootstrap when the runtime itself is unusable.
+  const activeRuntime = activeRuntimeState()
+
+  if (activeRuntime.shouldUseActiveRuntime && !bootstrapRepairRequested) {
+    if (!activeRuntime.hasValidMarker) {
+      rememberLog(
+        `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
+      )
+    }
+
     return createActiveBackend(backendArgs)
+  }
+
+  if (bootstrapRepairRequested) {
+    rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
   }
 
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
@@ -3568,7 +3766,11 @@ function resolveHermesBackend(backendArgs) {
       // and lets the resolver fall through to step 6 / bootstrap.
       const shellForProbe = isCommandScript(hermesCommand)
 
-      if (verifyHermesCli(hermesCommand, { shell: shellForProbe })) {
+      // HERMES_DESKTOP_HERMES is an explicit deployment override (used by
+      // the Nix wrapper), not a discovered PATH candidate. It must not fall
+      // through to the install-script bootstrap if the optional probe times
+      // out under load; the pinned backend is the only valid runtime there.
+      if (shouldTrustHermesOverride(hermesOverride) || verifyHermesCli(hermesCommand, { shell: shellForProbe })) {
         return (
           unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs) || {
             label: `existing Hermes CLI at ${hermesCommand}`,
@@ -3691,6 +3893,10 @@ async function ensureRuntime(backend) {
 
     bootstrapAbortController = new AbortController()
 
+    // The repair request has been honoured by reaching the installer; clear it
+    // so a later boot isn't forced through bootstrap again.
+    bootstrapRepairRequested = false
+
     const bootstrapResult = await runBootstrap({
       installStamp: backend.installStamp,
       activeRoot: backend.activeRoot,
@@ -3785,10 +3991,10 @@ async function ensureRuntime(backend) {
     // No venv at the expected location AND no bootstrap-needed sentinel
     // means we have a half-installed checkout: .git exists, source files
     // exist, but venv is missing or broken. This shouldn't happen in
-    // normal flow because isBootstrapComplete() requires
-    // isHermesSourceRoot() and the bootstrap writes the marker only after
-    // install.ps1 succeeds. If we hit this, the user (or a deleted venv)
-    // broke the invariant; tell them to re-run the install.
+    // normal flow because activeRuntimeState() requires isHermesSourceRoot()
+    // plus an importable hermes_cli before it hands back the active runtime.
+    // If we hit this, the user (or a deleted venv) broke the invariant; tell
+    // them to re-run the install.
     throw new Error(
       `Hermes venv missing at ${VENV_ROOT}. Re-run the desktop installer or ` + '`scripts/install.ps1` to rebuild it.'
     )
@@ -4634,40 +4840,88 @@ function closePreviewWatchers() {
   }
 }
 
-async function waitForHermes(baseUrl, token, signal?) {
-  const deadline = Date.now() + 45_000
-  let lastError = null
+// Best-effort read of a gateway's advertised auth providers, cached per base
+// URL for the life of the process. Used by the oauth pre-flight guard to tell
+// a password-provider gateway (which cannot satisfy the bearer/cookie checks
+// by design) from a real OAuth one. Any failure returns [] so callers keep the
+// strict guard — backends predating /api/auth/providers are unaffected.
+const gatewayAuthProvidersCache = new Map<string, any[]>()
 
-  while (Date.now() < deadline) {
-    if (signal?.aborted) {
-      const error: any = new Error('SSH bootstrap was superseded by newer connection settings.')
-      error.kind = 'superseded'
-      throw error
+async function gatewayAuthProviders(baseUrl) {
+  const cached = gatewayAuthProvidersCache.get(baseUrl)
+
+  if (cached) {
+    return cached
+  }
+
+  let providers = []
+
+  try {
+    const body = (await fetchPublicJson(`${baseUrl}/api/auth/providers`, { timeoutMs: 8_000 })) as any
+
+    if (Array.isArray(body?.providers)) {
+      providers = body.providers
+        .filter(p => p && typeof p === 'object')
+        .map(p => ({ name: String(p.name || ''), supportsPassword: Boolean(p.supports_password) }))
+        .filter(p => p.name)
     }
+  } catch {
+    // Optional metadata — an unreadable list keeps the strict guard.
+  }
 
-    try {
-      await fetchJson(`${baseUrl}/api/status`, token)
+  gatewayAuthProvidersCache.set(baseUrl, providers)
 
-      return
-    } catch (error) {
-      lastError = error
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, 500)
-        signal?.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(timer)
-            const aborted: any = new Error('SSH bootstrap was superseded by newer connection settings.')
-            aborted.kind = 'superseded'
-            reject(aborted)
-          },
-          { once: true }
-        )
-      })
+  return providers
+}
+
+// Build the readiness probe for a connection's auth mode. A gated gateway
+// must be probed with the SAME credentials the rest of the connection uses:
+// an anonymous probe 401s forever against a live session, and it can never
+// see the 404 that identifies a backend predating /api/health (the auth gate
+// answers before the SPA catch-all). `probeIsCredentialed` tells
+// waitForHermesReady how to read a 401 — rejected session vs gated route.
+async function buildReadinessHealthProbe(baseUrl, authMode, token) {
+  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+  const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
+
+  if (probeAuth.kind === 'bearer') {
+    return {
+      // fetchJson takes the bearer via `options.bearer` — a raw `headers`
+      // option is ignored, so passing one here would silently probe
+      // uncredentialed and reintroduce the 401 loop.
+      probeHealth: (url, options: any = {}) => fetchJson(url, null, { ...options, bearer: probeAuth.token }),
+      probeIsCredentialed: true
     }
   }
 
-  throw new Error(`Hermes backend did not become ready: ${lastError?.message || 'timeout'}`)
+  if (probeAuth.kind === 'cookie') {
+    return {
+      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeIsCredentialed: true
+    }
+  }
+
+  if (probeAuth.kind === 'token' && probeAuth.token) {
+    return {
+      probeHealth: (url, options: any = {}) => fetchJson(url, probeAuth.token, options),
+      probeIsCredentialed: true
+    }
+  }
+
+  return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
+}
+
+async function waitForHermes(baseUrl, token, signal?, authMode?) {
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+
+  return waitForHermesReady(baseUrl, {
+    token,
+    signal,
+    fetchPublicJson,
+    fetchJson: probeIsCredentialed ? (url, _token, options) => probeHealth(url, options) : fetchJson,
+    probeHealth,
+    probeIsCredentialed
+  })
 }
 
 function getWindowButtonPosition() {
@@ -4685,6 +4939,8 @@ function getNativeOverlayWidth() {
 function getWindowState(win = mainWindow) {
   return {
     isFullscreen: Boolean(win?.isFullScreen?.()),
+    isMinimized: Boolean(win?.isMinimized?.()),
+    isVisible: Boolean(win?.isVisible?.()),
     nativeOverlayWidth: getNativeOverlayWidth(),
     windowButtonPosition: getWindowButtonPosition()
   }
@@ -5851,6 +6107,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
       { refresh_token: tokens.refreshToken, provider: tokens.provider },
       { timeoutMs: 10_000 }
     )
+
     const rotated = parseTokenResponse(body)
     _storeNativeTokens(baseUrl, rotated)
 
@@ -5883,6 +6140,7 @@ async function mintGatewayWsTicket(baseUrl) {
       timeoutMs: 8_000,
       bearer: nativeAt
     })) as any
+
     const ticket = body?.ticket
 
     if (!ticket || typeof ticket !== 'string') {
@@ -6459,10 +6717,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
       // RFC 8252 flow) counts as connected too — otherwise a completed native
       // sign-in shows "not connected" in Settings. The authoritative liveness
       // check is the ws-ticket mint in resolveRemoteBackend at actual connect time.
-      remoteOauthConnected = oauthSessionIsLive(
-        hasNativeSession(remoteUrl),
-        await hasLiveOauthSession(remoteUrl)
-      )
+      remoteOauthConnected = oauthSessionIsLive(hasNativeSession(remoteUrl), await hasLiveOauthSession(remoteUrl))
     } catch {
       remoteOauthConnected = false
     }
@@ -6669,7 +6924,10 @@ async function buildRemoteConnection(
     // here would reject a freshly-completed native sign-in and loop the UI back
     // into "not signed in" even though mintGatewayWsTicket would succeed with
     // the stored bearer.
-    if (!oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl))) {
+    if (
+      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
+      oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl))
+    ) {
       const err = new Error(
         'Remote Hermes gateway uses OAuth, but you are not signed in. ' +
           'Open Settings → Gateway and click "Sign in", or switch back to Local.'
@@ -6910,7 +7168,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
       pickLocalPort,
-      waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal),
+      waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
@@ -7383,6 +7641,7 @@ function stopBackendChild(child) {
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
+  remoteReauthFailure = null
   remoteLiveness.clear()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
@@ -7583,7 +7842,7 @@ async function spawnPoolBackend(profile, entry) {
   const remote = await resolveRemoteBackend(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
 
     return {
       ...remote,
@@ -7775,6 +8034,13 @@ async function startHermes() {
     throw backendStartFailure
   }
 
+  // A confirmed remote reauth rejection is terminal until the user signs in.
+  // Short-circuiting here keeps the boot-failure overlay latched and its
+  // "Sign in" button clickable, instead of re-driving boot on every retry.
+  if (remoteReauthFailure) {
+    throw remoteReauthFailure
+  }
+
   // E2E: simulate a boot failure without breaking the real backend. The boot
   // progresses a few steps, then fails with the given error message.
   if (BOOT_FAKE_ERROR) {
@@ -7799,16 +8065,9 @@ async function startHermes() {
   let attemptedRemote = primaryBackendIsRemote()
 
   const connectionPromise = (async () => {
-    await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
-    // Resolve for the desktop's primary profile so a per-profile remote
-    // override on the active profile is honored (falls back to env / global).
-    // Re-read once resolved so the classification tracks the value actually used.
-    attemptedRemote = primaryBackendIsRemote()
-    const remote = await resolveRemoteBackend(primaryProfileKey())
-
-    if (remote) {
+    const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -7832,14 +8091,9 @@ async function startHermes() {
       }
     }
 
-    // Mutual exclusion with an in-app update (#50238). If this instance was
-    // relaunched while the Tauri updater is still applying an update, spawning
-    // a local backend now re-locks the venv shim and gets killed by the
-    // updater's straggler cleanup — looping. Park until the update finishes (or
-    // is detected stale), THEN start the backend. Local backends only; remote
-    // connections returned above and never touch the install tree.
-    await waitForUpdateToFinish()
-
+    await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+    // Resolve for the desktop's primary profile so a per-profile remote
+    // override on the active profile is honored (falls back to env / global).
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
@@ -7854,8 +8108,32 @@ async function startHermes() {
       backendArgs.unshift('--profile', activeProfile)
     }
 
-    await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
-    const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+    const setup = await runPrimaryBackendStartup({
+      connectRemote,
+      ensureLocalRuntime: ensureRuntime,
+      prepareLocalBackend: async () => {
+        await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+
+        return resolveHermesBackend(backendArgs)
+      },
+      resolveRemote: () => {
+        // Classify immediately before each throwing resolve. This callback runs
+        // both for an already-saved remote and after first-run remote Apply.
+        attemptedRemote = primaryBackendIsRemote()
+
+        return resolveRemoteBackend(primaryProfileKey())
+      },
+      waitForDecision: waitForFirstRunSetupChoice,
+      // Mutual exclusion with an in-app update (#50238). Remote connections
+      // return before this waiter; local starts park until the updater exits.
+      waitForLocalStart: waitForUpdateToFinish
+    })
+
+    if (setup.kind === 'remote') {
+      return setup.connection
+    }
+
+    const backend = setup.backend
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
@@ -8011,6 +8289,10 @@ async function startHermes() {
       throw error
     }
 
+    if (error instanceof FirstRunSetupResetError) {
+      throw error
+    }
+
     const message = error instanceof Error ? error.message : String(error)
 
     // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
@@ -8020,6 +8302,12 @@ async function startHermes() {
     // "Sign out & sign in" reload, and the wake-recovery revalidate path.
     if (shouldLatchBackendStartFailure({ attemptedRemote })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
+    // A confirmed reauth rejection latches separately: it can't self-heal, and
+    // leaving it unlatched hides the overlay's "Sign in" button on every retry.
+    if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
+      remoteReauthFailure = error instanceof Error ? error : new Error(message)
     }
 
     updateBootProgress(
@@ -8381,6 +8669,211 @@ function closePetOverlay() {
   petOverlayWindow = null
 }
 
+// ── Quick Entry ─────────────────────────────────────────────────────────────
+//
+// A global shortcut summons a small frameless always-on-top composer from
+// anywhere, so a prompt can be fired without raising the whole app. The window
+// carries NO gateway connection: it hands its text to us, we forward it to the
+// PRIMARY renderer, and that renderer submits through the same prompt path the
+// normal composer uses (see store/quick-entry + hooks/use-quick-entry-bridge).
+//
+// Main owns the OS registration and the persisted preference (it must restore
+// the shortcut on a cold launch without the renderer ever visiting Settings),
+// same authority split as keep-awake. Registration failure is surfaced, never
+// swallowed: a chord another app already owns comes back as `error: 'taken'`.
+const QUICK_ENTRY_CONFIG_PATH = path.join(app.getPath('userData'), 'quick-entry.json')
+
+let quickEntryWindow = null
+
+// Latest state push from the primary renderer (connection + recent sessions),
+// replayed to a quick window that spawns after the push happened.
+let quickEntryLastState = null
+
+function readQuickEntrySettings() {
+  try {
+    return sanitizeQuickEntrySettings(JSON.parse(fs.readFileSync(QUICK_ENTRY_CONFIG_PATH, 'utf8')))
+  } catch {
+    // Missing / unreadable / malformed → shipped defaults (enabled, default chord).
+    return sanitizeQuickEntrySettings(undefined)
+  }
+}
+
+function writeQuickEntrySettings(settings) {
+  try {
+    fs.mkdirSync(path.dirname(QUICK_ENTRY_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(QUICK_ENTRY_CONFIG_PATH, JSON.stringify(settings, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[quick-entry] write failed: ${error.message}`)
+  }
+}
+
+function quickEntryUrl() {
+  if (DEV_SERVER) {
+    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=quick#/`
+  }
+
+  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=quick#/`
+}
+
+function spawnQuickEntryWindow() {
+  const cursor = screen.getCursorScreenPoint()
+  const display = screen.getDisplayNearestPoint(cursor)
+  const bounds = quickEntryWindowBounds(display?.workArea)
+
+  const win = new BrowserWindow({
+    ...bounds,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    // Same rationale as the pet overlay: on Windows/Linux keep the helper out
+    // of the taskbar/alt-tab list; on macOS use an NSPanel so the frameless
+    // capture window never becomes the app's cmd-tab anchor.
+    skipTaskbar: !IS_MAC,
+    hasShadow: true,
+    alwaysOnTop: true,
+    type: IS_MAC ? 'panel' : undefined,
+    hiddenInMissionControl: IS_MAC,
+    show: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: PRELOAD_PATH,
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      devTools: true
+    }
+  })
+
+  win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
+  win.setHiddenInMissionControl?.(true)
+
+  try {
+    win.setVisibleOnAllWorkspaces(
+      true,
+      IS_MAC ? { visibleOnFullScreen: true, skipTransformProcessType: true } : undefined
+    )
+  } catch {
+    // Not supported everywhere — best effort.
+  }
+
+  // Opts out of global UI zoom for the same reason as the pet overlay: it sizes
+  // its own OS window and a zoomed composer would overflow it.
+  wireCommonWindowHandlers(win, zoomWiringForWindowKind('quickEntry'))
+
+  // Hide on blur. The window must never hold the user's focus captive — losing
+  // focus is the cheapest, least surprising dismiss (matches Spotlight).
+  win.on('blur', () => {
+    if (!win.isDestroyed()) {
+      win.hide()
+    }
+  })
+
+  win.on('closed', () => {
+    if (quickEntryWindow === win) {
+      quickEntryWindow = null
+    }
+  })
+
+  // Replay the last known gateway state as soon as the page can hear it — a
+  // freshly spawned quick window must not sit "disconnected" when the primary
+  // renderer already reported a live gateway.
+  win.webContents.on('did-finish-load', () => {
+    if (!win.isDestroyed() && quickEntryLastState) {
+      win.webContents.send('hermes:quick-entry:state', quickEntryLastState)
+    }
+  })
+
+  win.loadURL(quickEntryUrl())
+
+  return win
+}
+
+// Move the (already-open) window to the display the cursor is on, so the chord
+// summons it where the user is looking rather than where they last were.
+function repositionQuickEntryWindow(win) {
+  try {
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+    win.setBounds(quickEntryWindowBounds(display?.workArea))
+  } catch (error) {
+    rememberLog(`[quick-entry] reposition failed: ${error.message}`)
+  }
+}
+
+function showQuickEntryWindow() {
+  if (!quickEntryWindow || quickEntryWindow.isDestroyed()) {
+    quickEntryWindow = spawnQuickEntryWindow()
+    quickEntryWindow.once('ready-to-show', () => {
+      if (!quickEntryWindow?.isDestroyed()) {
+        quickEntryWindow.show()
+        quickEntryWindow.focus()
+      }
+    })
+
+    return
+  }
+
+  repositionQuickEntryWindow(quickEntryWindow)
+  quickEntryWindow.show()
+  quickEntryWindow.focus()
+  // Re-summoned: tell the renderer to clear any stale draft and refocus.
+  quickEntryWindow.webContents.send('hermes:quick-entry:shown')
+}
+
+function hideQuickEntryWindow() {
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.hide()
+  }
+}
+
+// The chord toggles: pressing it while the composer is up puts it away, so one
+// gesture does exactly one thing in both directions.
+function toggleQuickEntryWindow() {
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed() && quickEntryWindow.isVisible()) {
+    hideQuickEntryWindow()
+
+    return
+  }
+
+  showQuickEntryWindow()
+}
+
+const quickEntryShortcut = createQuickEntryShortcut(globalShortcut, toggleQuickEntryWindow)
+
+function applyQuickEntrySettings(settings) {
+  const state = quickEntryShortcut.apply(settings)
+
+  if (!settings.enabled) {
+    // Turning the feature off must not leave an orphan always-on-top window.
+    if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+      quickEntryWindow.close()
+    }
+
+    quickEntryWindow = null
+  }
+
+  if (state.error === 'taken') {
+    rememberLog(`[quick-entry] shortcut ${state.shortcut} is already taken by another application`)
+  } else if (state.error === 'invalid') {
+    rememberLog(`[quick-entry] shortcut ${state.shortcut} is not a valid accelerator`)
+  }
+
+  return { ...state, enabled: settings.enabled }
+}
+
+function closeQuickEntryWindow() {
+  quickEntryShortcut.dispose()
+
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.close()
+  }
+
+  quickEntryWindow = null
+}
+
 function createWindow() {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
@@ -8407,9 +8900,9 @@ function createWindow() {
     show: false,
     backgroundColor: getWindowBackgroundColor(),
     // Shared with the secondary session windows (chatWindowWebPreferences) so
-    // both keep `backgroundThrottling: false` — the chat transcript streams via
-    // a requestAnimationFrame-gated flush that Chromium pauses for blurred
-    // windows, stalling the live answer until refocus. See session-windows.ts.
+    // both keep `backgroundThrottling: false` — the chat transcript uses a
+    // bounded timer flush that Chromium clamps for blurred windows, stalling
+    // the live answer until refocus. See session-windows.ts.
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
@@ -8477,6 +8970,10 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+  mainWindow.on('minimize', () => sendWindowStateChanged())
+  mainWindow.on('restore', () => sendWindowStateChanged())
+  mainWindow.on('hide', () => sendWindowStateChanged())
+  mainWindow.on('show', () => sendWindowStateChanged())
 
   // Reopen where the user left off. resized/moved settle once per drag; close is
   // the cross-platform backstop, flushed synchronously before the window is gone.
@@ -8825,37 +9322,35 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   await teardownPrimaryBackendAndWait()
   bootstrapFailure = null
   backendStartFailure = null
-  bootstrapState = {
-    active: false,
-    manifest: null,
-    stages: {},
-    error: null,
-    log: [],
-    startedAt: null,
-    completedAt: null,
-    unsupportedPlatform: null
-  }
+  remoteReauthFailure = null
+  getFirstRunSetupGate().resetForRetry()
+  resetBootstrapSnapshot()
 
   return { ok: true }
 })
 ipcMain.handle('hermes:bootstrap:repair', async () => {
-  // Forceful repair: drop the bootstrap-complete marker so the next
-  // startHermes() re-runs the full installer (refreshing a broken/partial
-  // venv), and clear any latched failure + live connection. The renderer
-  // reloads afterwards to re-drive the boot flow from scratch.
-  rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
+  // Forceful repair: force the next startHermes() through the full installer
+  // (refreshing a broken/partial venv) and clear any latched failure + live
+  // connection. The renderer reloads afterwards to re-drive the boot flow.
+  //
+  // We do NOT delete the bootstrap marker here. Repair is also reachable from
+  // transient backend errors on a perfectly healthy install, and deleting the
+  // marker in that case stranded the app in first-run setup with no way back
+  // (#72166). The explicit flag carries the intent instead.
+  rememberLog('[bootstrap] repair requested by renderer; forcing reinstall + clearing latched failure')
 
-  try {
-    if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
-      fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
-    }
-  } catch (error) {
-    rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
-  }
-
+  bootstrapRepairRequested = true
   bootstrapFailure = null
   backendStartFailure = null
+  remoteReauthFailure = null
+  getFirstRunSetupGate().resetForRepair()
   resetHermesConnection()
+
+  return { ok: true }
+})
+ipcMain.handle('hermes:bootstrap:continue-local', async () => {
+  rememberLog('[bootstrap] local install selected by renderer; continuing first-launch bootstrap')
+  continueFirstRunLocalBootstrap()
 
   return { ok: true }
 })
@@ -8955,7 +9450,11 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
         postJson: (url, body, opts) => postJsonNoAuth(url, body, opts),
         rememberLog
       })
+
       _storeNativeTokens(baseUrl, tokens)
+      // Confirmed sign-in — release the reauth latch so the next
+      // startHermes() re-dials instead of replaying the stale rejection.
+      remoteReauthFailure = null
 
       return { ok: true, baseUrl, connected: true }
     } catch (error) {
@@ -8972,11 +9471,21 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   // Legacy embedded-webview cookie flow.
   await openOauthLoginWindow(baseUrl)
 
-  return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
+  const connected = await hasOauthSessionCookie(baseUrl)
+
+  // Only a CONFIRMED sign-in releases the latch. A cancelled/closed login
+  // window must leave it set, or the overlay's "Sign in" button starts
+  // flickering again on the next retry.
+  if (connected) {
+    remoteReauthFailure = null
+  }
+
+  return { ok: true, baseUrl, connected }
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
   await clearOauthSession(baseUrl || undefined)
+
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
   // logout clears BOTH auth shapes.
   if (baseUrl) {
@@ -8986,9 +9495,7 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
   // Report against the SAME liveness notion the Settings indicator uses
   // (AT-or-RT cookie, or a native token) so a logout that left any session
   // behind is reflected as still-connected rather than silently signed-out.
-  const connected = baseUrl
-    ? (await hasLiveOauthSession(baseUrl)) || hasNativeSession(baseUrl)
-    : false
+  const connected = baseUrl ? (await hasLiveOauthSession(baseUrl)) || hasNativeSession(baseUrl) : false
 
   return { ok: true, connected }
 })
@@ -9037,6 +9544,18 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   await applyConnectionChange({
     cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
     isPrimary: !key || key === primaryProfileKey(),
+    rehomePrimary: () =>
+      rehomePrimaryConnection({
+        clearLocalBootstrapFailure: () => {
+          // A remote connection bypasses local runtime/bootstrap failures. Clear
+          // the local-install latch so unsupported/failure escape paths can re-home.
+          bootstrapFailure = null
+        },
+        mode: config.mode,
+        notifyConnectionApplied: sendConnectionApplied,
+        resumeFirstRunRemote: abandonFirstRunSetupChoiceForRemoteApply,
+        teardownPrimaryBackend: teardownPrimaryBackendAndWait
+      }),
     scope,
     sendApplied: sendConnectionApplied,
     stopPool: stopPoolBackend,
@@ -9648,10 +10167,137 @@ ipcMain.on('hermes:keep-awake', (_event, on) => {
   }
 })
 
+// Quick Entry: the renderer reads the live registration state on settings mount
+// and writes the preference back. Main is authoritative — it owns the OS
+// accelerator — so both handlers return the state that ACTUALLY resulted,
+// including `registered: false` + `error: 'taken'` when another app owns the
+// chord. See electron/quick-entry.ts + store/quick-entry.
+ipcMain.handle('hermes:quick-entry:settings:get', async () => {
+  const settings = readQuickEntrySettings()
+  const state = quickEntryShortcut.current()
+
+  // Ground truth is what the last apply produced; the shortcut we report is the
+  // live one (a saved-but-rejected chord still shows what the user asked for).
+  return {
+    enabled: settings.enabled,
+    error: state.error,
+    registered: state.registered,
+    shortcut: settings.enabled ? state.shortcut : settings.shortcut
+  }
+})
+
+ipcMain.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
+  const current = readQuickEntrySettings()
+
+  const next = sanitizeQuickEntrySettings({
+    enabled: patch?.enabled === undefined ? current.enabled : patch.enabled === true,
+    shortcut: typeof patch?.shortcut === 'string' && patch.shortcut.trim() ? patch.shortcut : current.shortcut
+  })
+
+  writeQuickEntrySettings(next)
+
+  return applyQuickEntrySettings(next)
+})
+
+// Quick window → main → PRIMARY renderer. We never submit here: the renderer
+// owns the one prompt-submit path, and forwarding keeps it that way. The
+// payload is `{ target, text }` — target routing (current chat / a picked
+// session / new) is the renderer's job too.
+ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
+  hideQuickEntryWindow()
+
+  const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
+
+  if (!text) {
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    rememberLog('[quick-entry] dropped a submit: no primary window to route it to')
+
+    return
+  }
+
+  // Deliberately does NOT raise/focus the main window — the user asked to fire
+  // a prompt from wherever they were, not to be yanked into the app.
+  mainWindow.webContents.send('hermes:quick-entry:submit', {
+    target: typeof payload?.target === 'string' && payload.target ? payload.target : 'current',
+    text
+  })
+})
+
+// Primary renderer → main → quick window: gateway connection state + the
+// recent-session list for the target picker. Cached so a quick window spawned
+// AFTER the last push still boots from truth instead of "disconnected".
+ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
+  quickEntryLastState = payload ?? null
+
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.webContents.send('hermes:quick-entry:state', payload)
+  }
+})
+
+ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
   }
+})
+
+// ── Find-in-page (Ctrl/Cmd+F) ─────────────────────────────────────────────
+// The desktop supports multiple BrowserWindows (one primary plus any
+// per-session secondary windows spawned via `hermes:window:openSession`).
+// Find must run against the requesting window, not a global — otherwise
+// Cmd+F pressed in a secondary session window would search the primary
+// and the match counter would report matches the user can't see. Resolve
+// the sender through `BrowserWindow.fromWebContents(event.sender)` and
+// forward `found-in-page` results back to that same sender.
+
+// Lazily-installed forwarder per sender webContents. We track one
+// uninstall fn per webContents id and prune entries when the sender goes
+// away — Electron does not auto-detach webContents listeners on close,
+// so the map is the cleanup path.
+const foundInPageForwarders = new Map<number, () => void>()
+
+function ensureFoundInPageForwarder(sender: Electron.WebContents): void {
+  if (foundInPageForwarders.has(sender.id)) {
+    return
+  }
+
+  const uninstall = installFoundInPageForwarder(sender)
+  foundInPageForwarders.set(sender.id, uninstall)
+
+  sender.once('destroyed', () => {
+    foundInPageForwarders.get(sender.id)?.()
+    foundInPageForwarders.delete(sender.id)
+  })
+}
+
+ipcMain.handle('hermes:find-in-page', (event, query, options) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+
+  if (!win || win.isDestroyed()) {
+    return { count: 0 }
+  }
+
+  ensureFoundInPageForwarder(event.sender)
+  performFind(win.webContents, query, options)
+
+  // The match count arrives asynchronously via `found-in-page`; the
+  // synchronous return value is intentionally `{ count: 0 }` to mirror
+  // Electron's own `findInPage` return semantics (an opaque request id).
+  return { count: 0 }
+})
+
+ipcMain.handle('hermes:stop-find-in-page', event => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+
+  if (!win || win.isDestroyed()) {
+    return
+  }
+
+  stopFind(win.webContents)
 })
 
 ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
@@ -10664,6 +11310,10 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  // Quick Entry's global chord — registered on ready so a cold launch restores
+  // it without the renderer visiting Settings. A failed registration is logged
+  // here and surfaced in Settings via the IPC state (never silent).
+  applyQuickEntrySettings(readQuickEntrySettings())
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
@@ -10741,6 +11391,10 @@ app.on('before-quit', event => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
+
+  // Same for the Quick Entry composer — and release its global accelerator so a
+  // quitting Hermes never keeps another app's chord hostage.
+  closeQuickEntryWindow()
 
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {

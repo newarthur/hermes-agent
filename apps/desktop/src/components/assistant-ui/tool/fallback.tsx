@@ -26,6 +26,7 @@ import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { FadeText } from '@/components/ui/fade-text'
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -62,7 +63,6 @@ import {
   type ToolStatus,
   type ToolTitleAction
 } from './fallback-model'
-import { prettyJson } from './fallback-model/format'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
 // the per-row chrome (timer / preview). The flat ToolGroupSlot sets this
@@ -97,6 +97,44 @@ const TOOL_EXPANDED_SHELL_CLASS = 'rounded-[0.3125rem] border border-(--ui-strok
 
 const TOOL_SECTION_PRE_CLASS = cn(TOOL_SECTION_SURFACE_CLASS, 'font-mono text-[0.7rem] leading-relaxed')
 
+// Raw args/result dump — reference material, so a notch smaller than a body.
+const TOOL_PAYLOAD_PRE_CLASS = cn(TOOL_SECTION_SURFACE_CLASS, 'font-mono text-[0.65rem] leading-relaxed')
+
+/**
+ * Technical-mode raw payload, behind a chevron disclosure.
+ *
+ * Collapsed by default — in technical mode every tool row carries one, and
+ * expanding them all buries the transcript. Uses `DisclosureCaret` rather than
+ * a native `<details>`, whose marker is a browser-drawn triangle matching
+ * nothing else here.
+ */
+function ToolPayloadDisclosure({ args, result }: { args: unknown; result: unknown }) {
+  const [open, setOpen] = useState(false)
+
+  return (
+    // `py-0.5` tops up the parent's `p-1.5` to an even block on both edges.
+    <div className="max-w-full py-0.5">
+      <button
+        aria-expanded={open}
+        className={cn(
+          TOOL_SECTION_LABEL_CLASS,
+          'mb-0 flex items-center gap-1 bg-transparent transition-colors hover:text-(--ui-text-secondary)'
+        )}
+        onClick={() => setOpen(value => !value)}
+        type="button"
+      >
+        <DisclosureCaret className="text-(--ui-text-tertiary)" open={open} size="0.625rem" />
+        Tool payload
+      </button>
+      {open && (
+        <pre className={cn(TOOL_PAYLOAD_PRE_CLASS, 'mt-1 whitespace-pre-wrap wrap-anywhere')}>
+          {technicalTrace(args, result)}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 interface ToolStatusCopy {
   statusDone: string
   statusError: string
@@ -104,23 +142,39 @@ interface ToolStatusCopy {
   statusRunning: string
 }
 
-function rawTechnicalTrace(args: unknown, result: unknown): string {
-  const parts = [args, result]
-    .filter(value => value !== undefined && value !== null)
-    .map(value => {
-      if (typeof value === 'string') {
-        return value
-      }
+function prettyTechnicalValue(value: unknown): string {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
 
-      try {
-        return JSON.stringify(value)
-      } catch {
-        return String(value)
-      }
-    })
-    .filter(Boolean)
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+      return value
+    }
 
-  return clampForDisplay(parts.join('\n'))
+    try {
+      const parsed = JSON.parse(value)
+
+      return parsed && typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : value
+    } catch {
+      return value
+    }
+  }
+
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+export function technicalTrace(args: unknown, result: unknown): string {
+  const parts = [
+    ['Arguments', args],
+    ['Result', result]
+  ]
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([label, value]) => `${label}:\n${prettyTechnicalValue(value)}`)
+
+  return clampForDisplay(parts.join('\n\n'))
 }
 
 function statusGlyph(status: ToolStatus, copy: ToolStatusCopy): ReactNode {
@@ -363,7 +417,8 @@ function ToolEntry({ part }: ToolEntryProps) {
 
   const showDetail =
     !view.inlineDiff &&
-    ((view.status === 'error' && Boolean(detailSections.summary || detailSections.body)) ||
+    (Boolean(view.stdout || view.stderr) ||
+      (view.status === 'error' && Boolean(detailSections.summary || detailSections.body)) ||
       (view.status !== 'error' && Boolean(view.detail) && !detailMatchesTitle && !detailMatchesSubtitle))
 
   const renderDetailAsCode =
@@ -373,21 +428,16 @@ function ToolEntry({ part }: ToolEntryProps) {
   const hasSearchHits = Boolean(view.searchHits?.length)
   const searchResultsLabel = part.toolName === 'web_search' ? 'Search results' : view.detailLabel
 
-  // Only web_search renders the raw JSON drilldown, so serialize the result
-  // lazily here instead of prettyJson-ing every tool's result in buildToolView.
-  const rawResult = useMemo(
-    () => (part.toolName === 'web_search' && toolViewMode !== 'technical' ? prettyJson(part.result) : ''),
-    [part.toolName, part.result, toolViewMode]
-  )
-
-  const showRawSearchDrilldown =
-    part.toolName === 'web_search' &&
-    part.result !== undefined &&
-    toolViewMode !== 'technical' &&
-    Boolean(rawResult.trim())
-
   const hasExpandableContent = Boolean(
-    view.imageUrl || view.inlineDiff || showDetail || hasSearchHits || toolViewMode === 'technical'
+    view.imageUrl ||
+    view.inlineDiff ||
+    showDetail ||
+    hasSearchHits ||
+    view.stdout ||
+    view.stderr ||
+    view.terminalCommand ||
+    view.terminalExitCode !== undefined ||
+    toolViewMode === 'technical'
   )
 
   // copyAction reads the uncapped view.detail; clampForDisplay below only bounds
@@ -511,6 +561,9 @@ function ToolEntry({ part }: ToolEntryProps) {
               text={copyAction.text}
             />
           )}
+          {part.toolName === 'terminal' && toolViewMode !== 'technical' && (
+            <TerminalTranscript command={view.terminalCommand} exitCode={view.terminalExitCode} />
+          )}
           {view.imageUrl && (
             <div className="max-w-72 overflow-hidden rounded-[0.25rem] border border-(--ui-stroke-tertiary)">
               <ZoomableImage alt={copy.outputAlt} className="h-auto w-full object-cover" src={view.imageUrl} />
@@ -518,6 +571,12 @@ function ToolEntry({ part }: ToolEntryProps) {
           )}
           {hasSearchHits && view.searchHits && (
             <div className="max-w-full text-xs leading-relaxed text-(--ui-text-secondary)">
+              {view.searchQuery && (
+                <p className="mb-1 flex min-w-0 gap-1.5 wrap-anywhere">
+                  <span className="shrink-0 font-medium text-(--ui-text-tertiary)">Search</span>
+                  <span>{view.searchQuery}</span>
+                </p>
+              )}
               {searchResultsLabel && <p className={TOOL_SECTION_LABEL_CLASS}>{searchResultsLabel}</p>}
               <SearchResultsList hits={view.searchHits} />
             </div>
@@ -596,26 +655,42 @@ function ToolEntry({ part }: ToolEntryProps) {
                 )}
               </div>
             ))}
-          {showRawSearchDrilldown && (
-            <details className="max-w-full">
-              <summary className={cn(TOOL_SECTION_LABEL_CLASS, 'mb-0')}>{copy.rawResponse}</summary>
-              <pre className={cn(TOOL_SECTION_PRE_CLASS, 'mt-1 whitespace-pre-wrap wrap-anywhere')}>{rawResult}</pre>
-            </details>
-          )}
-          {toolViewMode === 'technical' && !(isFileEdit && view.inlineDiff) && (
-            <pre className={cn(TOOL_SECTION_PRE_CLASS, 'whitespace-pre-wrap wrap-anywhere')}>
-              {rawTechnicalTrace(part.args, part.result)}
-            </pre>
-          )}
-          {toolViewMode === 'technical' && isFileEdit && view.inlineDiff && (
-            <details className="max-w-full">
-              <summary className={cn(TOOL_SECTION_LABEL_CLASS, 'mb-0 cursor-pointer')}>Tool payload</summary>
-              <pre className={cn(TOOL_SECTION_PRE_CLASS, 'mt-1 whitespace-pre-wrap wrap-anywhere')}>
-                {rawTechnicalTrace(part.args, part.result)}
-              </pre>
-            </details>
-          )}
+          {toolViewMode === 'technical' && <ToolPayloadDisclosure args={part.args} result={part.result} />}
         </div>
+      )}
+    </div>
+  )
+}
+
+interface TerminalTranscriptProps {
+  command?: string
+  exitCode?: number
+}
+
+function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
+  if (!command && exitCode === undefined) {
+    return null
+  }
+
+  return (
+    <div className="flex min-w-0 items-center gap-2 rounded-[0.25rem] border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-2 py-1.5 font-mono text-[0.7rem] leading-relaxed">
+      {command && (
+        <code className="min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere text-(--ui-text-secondary)">
+          <span aria-hidden className="select-none text-(--ui-accent-secondary)">
+            ${' '}
+          </span>
+          {command}
+        </code>
+      )}
+      {exitCode !== undefined && (
+        <span
+          className={cn(
+            'shrink-0 rounded bg-(--ui-bg-tertiary) px-1 py-px text-[0.6rem] tabular-nums',
+            exitCode === 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'
+          )}
+        >
+          exit {exitCode}
+        </span>
       )}
     </div>
   )
@@ -625,10 +700,25 @@ function ToolEntry({ part }: ToolEntryProps) {
 // auto-scrolling window; fewer than this stays a plain inline stack.
 const TOOL_GROUP_SCROLL_THRESHOLD = 3
 
-// Tools whose body (an interactive form, a full-size image) must never be
-// trapped behind the window's max-height + fade mask. A run holding any of
-// them stays a plain, fully-visible stack no matter how long it is.
-export const UNBOUNDABLE_TOOLS = new Set(['clarify', 'image_generate'])
+// Tools whose body must never be trapped behind the window's max-height +
+// fade mask. A run holding any of them stays a plain, fully-visible stack no
+// matter how long it is.
+//
+// This list is deliberately tiny. A row rendered by ToolEntry carries
+// `data-tool-row`, and the `:has([data-tool-row][data-tool-open])` rule in
+// styles.css lifts the cap whenever one is open — so anything ToolEntry
+// renders takes care of itself. A code/diff row mounts open (see
+// `defaultOpen`), lifting the cap the moment it appears; a collapsed row is a
+// one-line status with no body in the DOM at all, so there is nothing to clip.
+//
+// Only components that bypass ToolEntry need this opt-out: `clarify` and
+// `image_generate` render their own markup, never emit `data-tool-row`, and so
+// the CSS escape hatch can never reach them.
+const UNBOUNDABLE_TOOLS = new Set(['clarify', 'image_generate'])
+
+export function isUnboundableTool(toolName: string): boolean {
+  return UNBOUNDABLE_TOOLS.has(toolName)
+}
 
 export function shouldBoundToolGroup(childCount: number, hasUnboundable: boolean) {
   return childCount >= TOOL_GROUP_SCROLL_THRESHOLD && !hasUnboundable
@@ -713,7 +803,7 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
   const hasUnboundable = useAuiState(s =>
     s.message.parts
       .slice(Math.max(0, startIndex), endIndex + 1)
-      .some(part => part.type === 'tool-call' && UNBOUNDABLE_TOOLS.has(part.toolName))
+      .some(part => part.type === 'tool-call' && isUnboundableTool(part.toolName))
   )
 
   const enterRef = useEnterAnimation(messageRunning, `tool-group:${messageId}:${startIndex}`)

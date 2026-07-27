@@ -475,7 +475,9 @@ TOOL_CATEGORIES = {
         "setup_title": "Select xAI Credential Source",
         "setup_note": (
             "Hermes routes X searches through xAI's built-in x_search "
-            "Responses tool. Both credential sources hit the same "
+            "Responses tool for read-only public X discovery. Use the xurl "
+            "skill for authenticated X API reads and account actions. Both "
+            "credential sources hit the same "
             "https://api.x.ai/v1/responses endpoint — pick whichever you "
             "already have. SuperGrok OAuth is preferred when both are set "
             "(uses your subscription quota instead of API spend)."
@@ -649,8 +651,15 @@ TOOLSET_ENV_REQUIREMENTS = {
 
 
 def _cua_driver_cmd() -> str:
-    """Return the cua-driver executable name/path, honoring non-empty overrides."""
+    """Return the configured cua-driver override, or the bare default name."""
     return os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() or "cua-driver"
+
+
+def _resolved_cua_driver_cmd() -> Optional[str]:
+    """Resolve cua-driver exactly as the runtime and Desktop status do."""
+    from tools.computer_use.cua_backend import resolve_cua_driver_cmd
+
+    return resolve_cua_driver_cmd()
 
 
 def _cua_driver_env() -> dict:
@@ -699,7 +708,7 @@ def _pip_install(
         try:
             result = subprocess.run(
                 [uv_bin, "pip", "install", *args],
-                capture_output=capture_output, text=True, timeout=timeout,
+                capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                 env=uv_env,
                 creationflags=_post_setup_no_window_flags(
                     streams_to_console=not capture_output
@@ -717,7 +726,7 @@ def _pip_install(
         # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
         probe = subprocess.run(
             pip_cmd + ["--version"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             creationflags=_post_setup_no_window_flags(),
         )
         if probe.returncode != 0:
@@ -726,7 +735,7 @@ def _pip_install(
         try:
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, timeout=120, check=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=True,
                 creationflags=_post_setup_no_window_flags(),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -738,7 +747,7 @@ def _pip_install(
 
     return subprocess.run(
         pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, timeout=timeout,
+        capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),
@@ -786,7 +795,7 @@ def _cua_install_target_writable() -> bool:
         return True
 
 
-def install_cua_driver(upgrade: bool = False) -> bool:
+def install_cua_driver(upgrade: bool = False, require_confirmed_update: bool = False) -> bool:
     """Install or refresh the cua-driver binary used by Computer Use.
 
     The upstream installer always pulls the latest release tag, so re-running
@@ -798,6 +807,19 @@ def install_cua_driver(upgrade: bool = False) -> bool:
     * ``upgrade=True`` — always re-run the installer (or call ``cua-driver
       update`` if the binary supports it). Used by ``hermes update`` and
       by ``hermes computer-use install --upgrade``.
+
+    ``require_confirmed_update`` (only meaningful with ``upgrade=True`` and
+    an installed binary): when the driver's native ``check-update`` verb
+    can't positively confirm that a newer release exists — the driver is
+    too old for the verb, the GitHub check failed, we're offline, or the
+    probe timed out — keep the installed version and return instead of
+    falling through to the full upstream installer. ``hermes update`` sets
+    this so a broken update check costs seconds, not a multi-minute silent
+    reinstall on every update (the upstream installer runs up to
+    ``_CUA_INSTALLER_TIMEOUT`` and install.ps1's concurrency lock can add
+    a further ~600s wait on Windows). ``hermes computer-use install
+    --upgrade`` leaves it False — an explicit upgrade request should still
+    reinstall when the check is indeterminate.
 
     Returns True iff cua-driver is installed (or successfully refreshed)
     when the function returns. Supported on macOS, Windows, and Linux
@@ -824,7 +846,7 @@ def install_cua_driver(upgrade: bool = False) -> bool:
     fetch_tool = "powershell" if is_windows else "curl"
 
     driver_cmd = _cua_driver_cmd()
-    binary = shutil.which(driver_cmd)
+    binary = _resolved_cua_driver_cmd()
 
     # Not installed → fresh install path (only when caller asked for it).
     if not binary and not upgrade:
@@ -849,8 +871,8 @@ def install_cua_driver(upgrade: bool = False) -> bool:
     if binary and not upgrade:
         try:
             version = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5, env=_cua_driver_env(),
+                [binary, "--version"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()
             _print_success(f"    {driver_cmd} already installed: {version or 'unknown version'}")
@@ -888,27 +910,42 @@ def install_cua_driver(upgrade: bool = False) -> bool:
 
     # Skip the (network) re-install when the driver itself reports it's already
     # on the latest release. Best-effort: an older driver (no check-update
-    # verb) or an offline check returns None, in which case we fall through and
-    # re-run the installer as before.
+    # verb) or an offline check returns None. What happens then depends on the
+    # caller: `hermes update` (require_confirmed_update=True) keeps the
+    # installed version — an indeterminate check must never cost the user a
+    # multi-minute silent reinstall on every update. An explicit
+    # `hermes computer-use install --upgrade` falls through and re-runs the
+    # installer as before.
     if binary:
+        _state = None
         try:
             from tools.computer_use.cua_backend import cua_driver_update_check
             _state = cua_driver_update_check()
-            if _state is not None and not _state.get("update_available"):
-                _print_success(
-                    f"    {driver_cmd} is already on the latest release "
-                    f"({_state.get('current_version') or 'unknown'})."
-                )
-                return True
         except Exception:
-            pass
+            _state = None
+        if _state is not None and not _state.get("update_available"):
+            _print_success(
+                f"    {driver_cmd} is already on the latest release "
+                f"({_state.get('current_version') or 'unknown'})."
+            )
+            return True
+        if _state is None and require_confirmed_update:
+            _print_info(
+                f"    Could not confirm a newer {driver_cmd} release "
+                "(offline, rate-limited, or driver too old to check); "
+                "keeping the installed version."
+            )
+            _print_info(
+                "    Force a refresh with: hermes computer-use install --upgrade"
+            )
+            return True
 
     if binary:
         # Show before/after version when we have a baseline. Best-effort.
         try:
             before = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5, env=_cua_driver_env(),
+                [binary, "--version"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()
         except Exception:
@@ -920,8 +957,8 @@ def install_cua_driver(upgrade: bool = False) -> bool:
     if ok and before:
         try:
             after = subprocess.run(
-                [driver_cmd, "--version"],
-                capture_output=True, text=True, timeout=5, env=_cua_driver_env(),
+                [binary, "--version"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()
             if after and after != before:
@@ -949,27 +986,116 @@ _CUA_INSTALLER_TIMEOUT = 660
 _CUA_LOCK_STALE_AFTER = 600
 
 
+def _cua_install_home() -> "Path":
+    """Package home shared by the upstream POSIX and Windows installers."""
+    return Path(
+        os.environ.get("CUA_DRIVER_RS_HOME")
+        or str(Path.home() / ".cua-driver")
+    )
+
+
 def _cua_install_lock_dir() -> "Path":
     """Path of the upstream installer's concurrent-install lock dir."""
-    home = os.environ.get("CUA_DRIVER_RS_HOME") or str(Path.home() / ".cua-driver")
-    return Path(home) / "packages" / ".install.lock.d"
+    return _cua_install_home() / "packages" / ".install.lock.d"
+
+
+def _cua_windows_install_lock_file() -> "Path":
+    """Path of install.ps1's FileShare::None lock file."""
+    return _cua_install_home() / "install.lock"
+
+
+def _clear_stale_windows_cua_install_lock() -> None:
+    """Delete install.ps1's lock file only when no process still holds it.
+
+    ``install.ps1`` serializes installs with a ``FileStream`` opened using
+    ``FileShare::None``. Mirror that primitive with a zero-share
+    ``CreateFileW`` probe. ``FILE_FLAG_DELETE_ON_CLOSE`` removes an unlocked
+    leftover atomically when the probe handle closes, avoiding a gap where a
+    new installer could acquire the file between our probe and deletion.
+    """
+    lock_file = _cua_windows_install_lock_file()
+    try:
+        if not lock_file.is_file():
+            return
+
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
+
+        # Win32 constants used by install.ps1's FileShare::None equivalent.
+        delete_access = 0x00010000
+        generic_read = 0x80000000
+        generic_write = 0x40000000
+        open_existing = 3
+        file_attribute_normal = 0x00000080
+        file_flag_delete_on_close = 0x04000000
+
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            _wintypes.LPCWSTR,
+            _wintypes.DWORD,
+            _wintypes.DWORD,
+            _wintypes.LPVOID,
+            _wintypes.DWORD,
+            _wintypes.DWORD,
+            _wintypes.HANDLE,
+        ]
+        create_file.restype = _wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [_wintypes.HANDLE]
+        close_handle.restype = _wintypes.BOOL
+
+        handle = create_file(
+            str(lock_file),
+            generic_read | generic_write | delete_access,
+            0,  # FileShare::None
+            None,
+            open_existing,
+            file_attribute_normal | file_flag_delete_on_close,
+            None,
+        )
+        invalid_handle = _wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            logger.debug(
+                "Windows cua install lock at %s is still held or cannot be "
+                "removed (winerror %s)",
+                lock_file,
+                _ctypes.get_last_error(),
+            )
+            return
+
+        if not close_handle(handle):
+            logger.debug(
+                "could not close Windows cua install lock probe at %s "
+                "(winerror %s)",
+                lock_file,
+                _ctypes.get_last_error(),
+            )
+            return
+        if lock_file.exists():
+            logger.debug(
+                "Windows cua install lock probe succeeded but %s remains",
+                lock_file,
+            )
+            return
+
+        logger.info("Cleared stale Windows cua-driver install lock at %s", lock_file)
+        _print_info(f"    Cleared stale cua-driver install lock ({lock_file}).")
+    except Exception as e:
+        logger.debug("stale Windows cua install lock check failed: %s", e)
 
 
 def _clear_stale_cua_install_lock() -> None:
     """Best-effort: remove a stale installer lock left by a dead holder.
 
-    A previous timed-out/killed install can orphan
-    ``~/.cua-driver/packages/.install.lock.d`` (the holder's pid is stamped
-    into its ``info`` file). The upstream installer only reclaims it after
-    waiting 600s — longer than our old subprocess timeout — so an orphaned
-    lock wedged every subsequent refresh. Clear it up front when the holder
-    is provably dead; leave it alone when the holder is alive (a slow
-    concurrent install) or liveness can't be determined.
-
-    POSIX-only: the lock protocol lives in the bash installer; install.ps1
-    does not use it.
+    The POSIX installer stamps its holder pid into
+    ``~/.cua-driver/packages/.install.lock.d/info``. The Windows installer
+    instead holds ``~/.cua-driver/install.lock`` open with
+    ``FileShare::None``. Clear either artifact up front only when its
+    platform-specific liveness check proves that no install still holds it.
     """
     if sys.platform == "win32":
+        _clear_stale_windows_cua_install_lock()
         return
     lock_dir = _cua_install_lock_dir()
     try:
@@ -1066,7 +1192,7 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
         try:
             dl = subprocess.run(
                 ["curl", "-fsSL", "-o", script_path, install_url],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             _print_warning(f"    cua-driver installer download failed: {e}")
@@ -1113,7 +1239,48 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
             if not is_windows:
                 os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)  # windows-footgun: ok — POSIX branch only
             else:
-                proc.kill()
+                # PowerShell may leave download/install helpers alive after its
+                # direct process is killed. Those descendants inherit stdout
+                # and can keep both communicate() and install.lock wedged, so
+                # collect the tree first and kill it leaf-up.
+                import psutil as _psutil
+
+                try:
+                    parent = _psutil.Process(proc.pid)
+                    descendants = parent.children(recursive=True)
+                except _psutil.NoSuchProcess:
+                    return
+                except _psutil.Error as e:
+                    logger.debug(
+                        "could not enumerate cua-driver installer tree for pid %s: %s",
+                        proc.pid,
+                        e,
+                    )
+                    proc.kill()
+                    return
+
+                for child in reversed(descendants):
+                    try:
+                        child.kill()
+                    except _psutil.NoSuchProcess:
+                        pass
+                    except _psutil.Error as e:
+                        logger.debug(
+                            "could not kill cua-driver installer child pid %s: %s",
+                            child.pid,
+                            e,
+                        )
+                try:
+                    parent.kill()
+                except _psutil.NoSuchProcess:
+                    pass
+                except _psutil.Error as e:
+                    logger.debug(
+                        "could not kill cua-driver installer parent pid %s: %s",
+                        proc.pid,
+                        e,
+                    )
+                    proc.kill()
         except (OSError, ProcessLookupError):
             proc.kill()
 
@@ -1234,7 +1401,7 @@ def _run_post_setup(post_setup_key: str):
                 # only, avoiding the apps/* glob which would pull in
                 # apps/desktop (Electron + node-pty) unnecessarily. See #38772.
                 [npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
@@ -1314,7 +1481,7 @@ def _run_post_setup(post_setup_key: str):
         try:
             result = subprocess.run(
                 install_cmd,
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=600,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT), timeout=600,
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
@@ -1348,7 +1515,7 @@ def _run_post_setup(post_setup_key: str):
             result = subprocess.run(
                 # --workspaces=false avoids resolving apps/desktop. See #38772.
                 [_npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
@@ -2672,7 +2839,7 @@ _POST_SETUP_INSTALLED: dict = {
     # entry when (a) the post_setup is the ONLY install side-effect for
     # a no-key provider, and (b) an installed-state check is cheap and
     # doesn't trigger a heavy import.
-    "cua_driver": lambda: bool(shutil.which(_cua_driver_cmd())),
+    "cua_driver": lambda: _resolved_cua_driver_cmd() is not None,
 }
 
 
@@ -2730,7 +2897,7 @@ _POST_SETUP_READY: dict = {
     "agent_browser": lambda: _agent_browser_installed(),
     "browserbase": lambda: _cloud_agent_browser_installed(),
     "camofox": lambda: _camofox_installed(),
-    "cua_driver": lambda: bool(shutil.which(_cua_driver_cmd())),
+    "cua_driver": lambda: _resolved_cua_driver_cmd() is not None,
 }
 
 
@@ -3801,18 +3968,33 @@ def _configure_vision_backend() -> None:
 def _configure_vision_provider_model(config: dict, vision_cfg: dict) -> None:
     """Provider + model picker for vision, mirroring the ``/model`` surface.
 
-    Lists authenticated providers (same data source as the model switcher),
-    lets the user pick one and then a model from its curated list (or type a
-    custom id), and persists ``auxiliary.vision.provider`` + ``.model``.
+    Provider rows come from ``build_aux_picker_rows()`` — the shared aux-picker
+    substrate — so this picker lists exactly what the ``hermes model`` aux-task
+    picker lists, including the user's own ``providers:`` / ``custom_providers:``
+    endpoints. Lets the user pick a provider and then a model from its curated
+    list (or type a custom id), and persists ``auxiliary.vision.provider`` +
+    ``.model``.
     """
     try:
-        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.inventory import (
+            build_aux_picker_rows,
+            format_aux_picker_entries,
+        )
     except Exception as exc:  # pragma: no cover - import guard
         _print_warning(f"  Could not load provider list: {exc}")
         return
 
+    current_provider = str(vision_cfg.get("provider") or "").strip()
+    current_model = str(vision_cfg.get("model") or "").strip()
+    current_base_url = str(vision_cfg.get("base_url") or "").strip()
+
     try:
-        providers = list_authenticated_providers(max_models=40)
+        providers = build_aux_picker_rows(
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            max_models=40,
+        )
     except Exception as exc:
         _print_warning(f"  Could not detect providers: {exc}")
         providers = []
@@ -3824,11 +4006,14 @@ def _configure_vision_provider_model(config: dict, vision_cfg: dict) -> None:
         )
         return
 
-    provider_labels = []
-    for p in providers:
-        name = p.get("name") or p.get("slug")
-        total = p.get("total_models", len(p.get("models", [])))
-        provider_labels.append(f"{name}  ({total} models)" if total else str(name))
+    provider_labels = [
+        label
+        for _slug, label, _models in format_aux_picker_entries(
+            providers,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+        )
+    ]
     provider_labels.append("Cancel")
 
     pidx = _prompt_choice("  Choose vision provider:", provider_labels, 0)

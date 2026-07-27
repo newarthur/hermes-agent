@@ -184,10 +184,25 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
 /** Publish one session's state. Automatically fires transition side-effects
  *  (watchdog arm/disarm, settle grace, unread marker, compression id rotation)
  *  by diffing previous vs next — callers never need to manually call a
- *  transition handler. */
+ *  transition handler.
+ *
+ *  Skips the publish when the new state is identical to the existing one
+ *  (same reference) to avoid churning `$sessionStates` on periodic
+ *  `session.info` heartbeats that carry no change — otherwise every ~1/s
+ *  heartbeat creates a new Record spread, triggering computed atoms
+ *  ($workingSessionIds, $attentionSessionIds) and their subscribers
+ *  unnecessarily. The runtime-id→state cache (sessionStateByRuntimeIdRef)
+ *  is updated independently by the caller, so the visual path stays live
+ *  without the store churn. */
 export function publishSessionState(runtimeId: string, state: ClientSessionState) {
-  const prev = $sessionStates.get()[runtimeId] ?? null
-  $sessionStates.set({ ...$sessionStates.get(), [runtimeId]: state })
+  const current = $sessionStates.get()
+  const prev = current[runtimeId] ?? null
+
+  if (prev === state) {
+    return
+  }
+
+  $sessionStates.set({ ...current, [runtimeId]: state })
   handleTransition(prev, state, runtimeId)
 }
 
@@ -540,12 +555,46 @@ export function openSessionTile(
   }
 }
 
+/** ⌘W on the MAIN tab: the next session tab stacked WITH the workspace, to
+ *  shift into main. Walks the workspace group's strip from the workspace tab
+ *  outward (the tab after it first, then wrapping to the ones before), and
+ *  returns the first session tile's stored id. Null when the workspace has no
+ *  session tab stacked beside it (⌘W then stays the no-op it was). */
+export function nextSessionTileForWorkspace(): null | string {
+  const tree = $layoutTree.get()
+  const group = tree ? findGroupOfPane(tree, 'workspace') : null
+
+  if (!group) {
+    return null
+  }
+
+  const tiles = $sessionTiles.get()
+  const idx = group.panes.indexOf('workspace')
+  // After the workspace tab first, then the ones before it (nearest-out).
+  const ordered = [...group.panes.slice(idx + 1), ...group.panes.slice(0, idx).reverse()]
+
+  for (const paneId of ordered) {
+    if (paneId.startsWith(TILE_PANE_PREFIX)) {
+      const storedSessionId = paneId.slice(TILE_PANE_PREFIX.length)
+
+      if (tiles.some(t => t.storedSessionId === storedSessionId)) {
+        return storedSessionId
+      }
+    }
+  }
+
+  return null
+}
+
 /** If a session is already ON SCREEN — an open tile OR the one loaded in main —
- *  front its tab (and focus its zone) and return true. A sidebar click on an
- *  already-open chat JUMPS to its tab instead of reloading it; `false` means the
+ *  front its tab (and focus its zone) and report WHICH. A sidebar click on an
+ *  already-open chat JUMPS to its tab instead of reloading it; `null` means the
  *  caller must load it into main. Covers the two dead clicks: an open tile, and
- *  the main session while focus sits on a tile (route unchanged → no reload). */
-export function focusOpenSession(storedSessionId: string): boolean {
+ *  the main session while focus sits on a tile (route unchanged → no reload).
+ *  Callers that own the router need the `'main'` vs `'tile'` distinction: a
+ *  `'main'` hit only reaches the screen if the workspace pane is actually
+ *  showing the chat, whereas a tile renders in its own pane regardless. */
+export function focusOpenSession(storedSessionId: string): 'main' | 'tile' | null {
   if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
     const paneId = `${TILE_PANE_PREFIX}${storedSessionId}`
     revealTreePane(paneId) // un-dismiss + adopt + front in its group
@@ -556,7 +605,7 @@ export function focusOpenSession(storedSessionId: string): boolean {
       noteActiveTreeGroup(group.id)
     }
 
-    return true
+    return 'tile'
   }
 
   // Already the main session: front the workspace tab and drop tile focus so
@@ -565,10 +614,19 @@ export function focusOpenSession(storedSessionId: string): boolean {
     revealTreePane('workspace')
     noteActiveTreeGroup(null)
 
-    return true
+    return 'main'
   }
 
-  return false
+  return null
+}
+
+/** Does a sidebar click still need to navigate after `focusOpenSession`? A miss
+ *  always does. A `'main'` hit does too while the workspace pane is showing a
+ *  full page (artifacts, skills, …): fronting the workspace tab doesn't put the
+ *  chat back on screen — only a route change back to the session does. A tile
+ *  hit never does; its pane renders the chat regardless of the route. */
+export function focusedSessionNeedsRoute(focused: 'main' | 'tile' | null, workspaceIsPage: boolean): boolean {
+  return !focused || (focused === 'main' && workspaceIsPage)
 }
 
 // Closed-tab stack for ⌘⇧T reopen (in-memory) — keyed PER PROFILE like the

@@ -26,6 +26,7 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
+from urllib.parse import urljoin
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -67,6 +68,8 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
 })
+_DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_DISCORD_IMAGE_MAX_REDIRECTS = 10
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -133,6 +136,43 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+
+
+async def _read_url_image_with_redirect_guard(
+    session: Any,
+    url: str,
+    *,
+    timeout: Any,
+    request_kwargs: Dict[str, Any],
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """Read an image URL while re-checking every redirect target for SSRF."""
+    current_url = url
+    for _ in range(_DISCORD_IMAGE_MAX_REDIRECTS + 1):
+        if not is_safe_url(current_url):
+            raise ValueError("Blocked unsafe image URL redirect")
+
+        async with session.get(
+            current_url,
+            timeout=timeout,
+            allow_redirects=False,
+            **request_kwargs,
+        ) as resp:
+            raw_headers = getattr(resp, "headers", {}) or {}
+            headers = {str(key).lower(): value for key, value in dict(raw_headers).items()}
+            status = int(getattr(resp, "status", 0))
+            if status in _DISCORD_IMAGE_REDIRECT_STATUSES:
+                location = headers.get("location")
+                if not location:
+                    return status, b"", headers
+                next_url = urljoin(current_url, str(location))
+                if not is_safe_url(next_url):
+                    raise ValueError("Blocked redirect to private/internal address")
+                current_url = next_url
+                continue
+
+            return status, await resp.read(), headers
+
+    raise ValueError("Too many image URL redirects")
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -3066,6 +3106,30 @@ class DiscordAdapter(BasePlatformAdapter):
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
 
+        if file is not None or files:
+            attachments = getattr(starter_msg, "attachments", None) or []
+            if not attachments:
+                filename = ""
+                if file is not None:
+                    filename = getattr(file, "filename", "") or ""
+                elif files:
+                    filename = getattr(files[0], "filename", "") or ""
+                logger.warning(
+                    "[%s] Forum thread %s starter has no attachments for %s",
+                    self.name,
+                    thread_id,
+                    filename or "file",
+                )
+                return SendResult(
+                    success=False,
+                    error=(
+                        "Discord created the forum thread but attached no files"
+                        + (f" ({filename})" if filename else "")
+                    ),
+                    message_id=message_id or None,
+                    raw_response={"thread_id": thread_id},
+                )
+
         return SendResult(
             success=True,
             message_id=message_id,
@@ -3301,9 +3365,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Forum channels (type 15) get a new thread whose starter message
         carries the file — they reject direct POST /messages.
+
+        Uses a path-based ``discord.File`` (same pattern as
+        ``send_multiple_images``) rather than an open file handle. The
+        handle form can race with Discord's multipart encoder after an
+        earlier image batch on the same channel and produce a successful
+        message with zero attachments — a silent drop for video/document
+        MEDIA tags (#66797).
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        if not os.path.isfile(file_path):
+            return SendResult(success=False, error=f"File not found: {file_path}")
 
         channel = self._client.get_channel(int(chat_id))
         if not channel:
@@ -3312,15 +3386,45 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
         filename = file_name or os.path.basename(file_path)
-        with open(file_path, "rb") as fh:
-            file = discord.File(fh, filename=filename)
-            if self._is_forum_parent(channel):
-                return await self._forum_post_file(
-                    channel,
-                    content=(caption or "").strip(),
-                    file=file,
-                )
-            msg = await channel.send(content=caption if caption else None, file=file)
+        logger.info(
+            "[%s] Sending file attachment %s (%s) to %s",
+            self.name,
+            filename,
+            os.path.splitext(filename)[1].lower() or "no-ext",
+            chat_id,
+        )
+        # Path-based File: discord.py owns open/close for the upload, matching
+        # the working image-batch path. Prefer ``files=[...]`` over deprecated
+        # singular ``file=`` for the same reason.
+        discord_file = discord.File(file_path, filename=filename)
+        if self._is_forum_parent(channel):
+            result = await self._forum_post_file(
+                channel,
+                content=(caption or "").strip(),
+                files=[discord_file],
+            )
+            return result
+        msg = await channel.send(
+            content=caption if caption else None,
+            files=[discord_file],
+        )
+        attachments = getattr(msg, "attachments", None) or []
+        if not attachments:
+            # Discord accepted the message but attached nothing — the failure
+            # mode reported in #66797 (MEDIA video stripped from text, no
+            # attachment, no prior log line). Fail loud so the dispatch loop
+            # surfaces a warning instead of a silent drop.
+            logger.warning(
+                "[%s] Discord returned message %s with no attachments for %s",
+                self.name,
+                getattr(msg, "id", "?"),
+                filename,
+            )
+            return SendResult(
+                success=False,
+                error=f"Discord accepted the message but attached no files ({filename})",
+                message_id=str(getattr(msg, "id", "") or "") or None,
+            )
         return SendResult(success=True, message_id=str(msg.id))
 
     async def send_multiple_images(
@@ -3396,25 +3500,27 @@ class DiscordAdapter(BasePlatformAdapter):
                             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
                             if aiohttp_session is None:
                                 aiohttp_session = _aiohttp.ClientSession(**_sess_kw)
-                            async with aiohttp_session.get(
-                                image_url, timeout=_aiohttp.ClientTimeout(total=30), **_req_kw,
-                            ) as resp:
-                                if resp.status != 200:
-                                    logger.warning(
-                                        "[%s] Failed to download image (HTTP %d) in batch: %s",
-                                        self.name, resp.status, image_url[:80],
-                                    )
-                                    continue
-                                data = await resp.read()
-                                ct = resp.headers.get("content-type", "image/png")
-                                ext = "png"
-                                if "jpeg" in ct or "jpg" in ct:
-                                    ext = "jpg"
-                                elif "gif" in ct:
-                                    ext = "gif"
-                                elif "webp" in ct:
-                                    ext = "webp"
-                                files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
+                            status, data, headers = await _read_url_image_with_redirect_guard(
+                                aiohttp_session,
+                                image_url,
+                                timeout=_aiohttp.ClientTimeout(total=30),
+                                request_kwargs=_req_kw,
+                            )
+                            if status != 200:
+                                logger.warning(
+                                    "[%s] Failed to download image (HTTP %d) in batch: %s",
+                                    self.name, status, image_url[:80],
+                                )
+                                continue
+                            ct = headers.get("content-type", "image/png")
+                            ext = "png"
+                            if "jpeg" in ct or "jpg" in ct:
+                                ext = "jpg"
+                            elif "gif" in ct:
+                                ext = "gif"
+                            elif "webp" in ct:
+                                ext = "webp"
+                            files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
                             continue
@@ -4531,37 +4637,40 @@ class DiscordAdapter(BasePlatformAdapter):
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
             async with aiohttp.ClientSession(**_sess_kw) as session:
-                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to download image: HTTP {resp.status}")
+                status, image_data, headers = await _read_url_image_with_redirect_guard(
+                    session,
+                    image_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    request_kwargs=_req_kw,
+                )
+                if status != 200:
+                    raise Exception(f"Failed to download image: HTTP {status}")
 
-                    image_data = await resp.read()
+                # Determine filename from URL or content type
+                content_type = headers.get("content-type", "image/png")
+                ext = "png"
+                if "jpeg" in content_type or "jpg" in content_type:
+                    ext = "jpg"
+                elif "gif" in content_type:
+                    ext = "gif"
+                elif "webp" in content_type:
+                    ext = "webp"
 
-                    # Determine filename from URL or content type
-                    content_type = resp.headers.get("content-type", "image/png")
-                    ext = "png"
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = "jpg"
-                    elif "gif" in content_type:
-                        ext = "gif"
-                    elif "webp" in content_type:
-                        ext = "webp"
+                import io
+                file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
 
-                    import io
-                    file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
-
-                    if self._is_forum_parent(channel):
-                        return await self._forum_post_file(
-                            channel,
-                            content=(caption or "").strip(),
-                            file=file,
-                        )
-
-                    msg = await channel.send(
-                        content=caption if caption else None,
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content=(caption or "").strip(),
                         file=file,
                     )
-                    return SendResult(success=True, message_id=str(msg.id))
+
+                msg = await channel.send(
+                    content=caption if caption else None,
+                    file=file,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
             logger.warning(
@@ -4610,27 +4719,30 @@ class DiscordAdapter(BasePlatformAdapter):
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
             async with aiohttp.ClientSession(**_sess_kw) as session:
-                async with session.get(animation_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Failed to download animation: HTTP {resp.status}")
+                status, animation_data, _headers = await _read_url_image_with_redirect_guard(
+                    session,
+                    animation_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    request_kwargs=_req_kw,
+                )
+                if status != 200:
+                    raise Exception(f"Failed to download animation: HTTP {status}")
 
-                    animation_data = await resp.read()
+                import io
+                file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
 
-                    import io
-                    file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
-
-                    if self._is_forum_parent(channel):
-                        return await self._forum_post_file(
-                            channel,
-                            content=(caption or "").strip(),
-                            file=file,
-                        )
-
-                    msg = await channel.send(
-                        content=caption if caption else None,
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content=(caption or "").strip(),
                         file=file,
                     )
-                    return SendResult(success=True, message_id=str(msg.id))
+
+                msg = await channel.send(
+                    content=caption if caption else None,
+                    file=file,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
             logger.warning(
@@ -8116,7 +8228,7 @@ def _define_discord_view_classes() -> None:
                 home = get_hermes_home()
                 response_path = home / ".update_response"
                 tmp = response_path.with_suffix(".tmp")
-                tmp.write_text(answer)
+                tmp.write_text(answer, encoding="utf-8")
                 tmp.replace(response_path)
                 logger.info(
                     "Discord update prompt answered '%s' by %s",
@@ -9224,7 +9336,7 @@ def interactive_setup() -> None:
     the plugin's import surface stays small, prompts for the bot token,
     captures an allowlist, and offers to set a home channel.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
@@ -9288,9 +9400,12 @@ def interactive_setup() -> None:
     print_info("   To get a channel ID: right-click a channel → Copy Channel ID")
     print_info("   (requires Developer Mode in Discord settings)")
     print_info("   You can also set this later by typing /set-home in a Discord channel.")
-    home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
+    home_channel = prompt("Home channel ID (leave empty to set later with /set-home)").strip()
     if home_channel:
         save_env_value("DISCORD_HOME_CHANNEL", home_channel)
+    else:
+        if remove_env_value("DISCORD_HOME_CHANNEL"):
+            print_info("Home channel cleared.")
 
 
 def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
@@ -9474,7 +9589,7 @@ def register(ctx) -> None:
         check_fn=check_discord_requirements,
         is_connected=_is_connected,
         required_env=["DISCORD_BOT_TOKEN"],
-        install_hint="pip install 'hermes-agent[messaging]'",
+        install_hint="Run `hermes setup` to install Discord support.",
         # Interactive setup wizard — replaces the central
         # hermes_cli/setup.py::_setup_discord function.  Same shape as Teams.
         setup_fn=interactive_setup,

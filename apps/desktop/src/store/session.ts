@@ -26,10 +26,49 @@ const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
+//
+// Scoped per profile: a single global key remembered ONE session across every
+// profile, so relaunching (or a cold start) under profile B would try to
+// restore a session that belongs to profile A — one of the ways a conversation
+// appears to bleed between profiles (#63590). Each profile now remembers its
+// own last session. The default profile keeps the original unsuffixed key so
+// existing installs' remembered session survives the upgrade.
 const LAST_SESSION_KEY = 'hermes.desktop.lastSessionId'
 
-export const getRememberedSessionId = (): null | string => storedString(LAST_SESSION_KEY)
-export const setRememberedSessionId = (id: null | string) => persistString(LAST_SESSION_KEY, id)
+function rememberedSessionKey(profile?: null | string): string {
+  const key = (profile ?? '').trim()
+
+  return !key || key === 'default' ? LAST_SESSION_KEY : `${LAST_SESSION_KEY}.${key}`
+}
+
+export const getRememberedSessionId = (profile?: null | string): null | string =>
+  storedString(rememberedSessionKey(profile))
+export const setRememberedSessionId = (id: null | string, profile?: null | string) =>
+  persistString(rememberedSessionKey(profile), id)
+
+/**
+ * The profile a routed session belongs to, for keying the remembered id.
+ *
+ * Prefer the owning profile recorded on the session row (the cross-profile
+ * aggregator tags each row), so the session is remembered under ITS profile
+ * even while a different one is live. Falls back to the active gateway profile
+ * for a session not yet in the in-memory list.
+ */
+export function rememberedSessionProfile(
+  sessions: readonly SessionInfo[],
+  sessionId: null | string,
+  activeProfile: null | string
+): string {
+  if (sessionId) {
+    const owner = sessions.find(session => sessionMatchesStoredId(session, sessionId))?.profile?.trim()
+
+    if (owner) {
+      return owner
+    }
+  }
+
+  return (activeProfile ?? '').trim() || 'default'
+}
 
 // The last non-overlay route (a page like /skills, or a session route), so a
 // relaunch lands back where you were instead of a bare new-chat.
@@ -113,12 +152,6 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
 export function applyConfiguredDefaultProjectDir(dir: null | string | undefined): void {
   configuredDefaultProjectDir = dir?.trim() || ''
-
-  // Cache only — new chats read this via workspaceCwdForNewSession(). Do not
-  // rewrite the live workspace (or localStorage) while a session is active.
-  if (configuredDefaultProjectDir && !$activeSessionId.get()) {
-    setCurrentCwd(configuredDefaultProjectDir)
-  }
 }
 
 interface AppAtom<T> {
@@ -237,7 +270,6 @@ export function mergeSessionPage(
 export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom<ConnectionState>('idle')
 export const $sessions = atom<SessionInfo[]>([])
-export const $sessionsTotal = atom<number>(0)
 // Cron-job sessions (source === 'cron') are fetched as their own list so the
 // scheduler's always-newest sessions never crowd recents out of the page
 // budget. Powers the collapsed "Cron jobs" sidebar section.
@@ -261,11 +293,13 @@ export const $messagingPlatformTotals = atom<Record<string, number>>({})
 // True when the combined seed fetch hit MESSAGING_SECTION_LIMIT, so at least
 // one platform may have more rows on disk than were loaded.
 export const $messagingTruncated = atom<boolean>(false)
-// Listable conversation count per profile (children excluded), keyed by profile
-// name. Lets the sidebar scope its "Load more" footer to the active profile so a
-// huge default profile doesn't keep "Load more" visible while browsing a small
-// one. Empty for single-profile users (fall back to $sessionsTotal).
-export const $sessionProfileTotals = atom<Record<string, number>>({})
+// Whether a profile's last session page was CAPPED by the request limit, keyed
+// by profile name — i.e. more rows exist on disk than were loaded. Replaces the
+// old exact per-profile totals: rendering `loaded/total` in the sidebar cost a
+// COUNT(*) per profile DB on every refresh and only ever confused people, while
+// "is there another page?" is what pagination actually needs and comes free
+// from the row count the query already returned.
+export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -343,14 +377,13 @@ export const $sessionPickerOpen = atom(false)
 export const setConnection = (next: Updater<HermesConnection | null>) => updateAtom($connection, next)
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
-export const setSessionsTotal = (next: Updater<number>) => updateAtom($sessionsTotal, next)
 export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
 export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom($messagingSessions, next)
 export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($messagingPlatformTotals, next)
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
-export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
-  updateAtom($sessionProfileTotals, next)
+export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
+  updateAtom($sessionProfilesTruncated, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
@@ -420,6 +453,14 @@ export const setCurrentReasoningEffort = (next: Updater<string>) => {
   updateAtom($currentReasoningEffort, next)
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
 }
+
+// The profile's `agent.reasoning_effort`, mirrored from config so surfaces that
+// need to render or apply "the default" resolve the user's configured level
+// instead of assuming DEFAULT_REASONING_EFFORT (lib/reasoning-effort). Empty
+// until config loads, and re-seeded on every profile switch by useHermesConfig.
+export const $defaultReasoningEffort = atom('')
+
+export const setDefaultReasoningEffort = (next: string) => updateAtom($defaultReasoningEffort, next)
 
 export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($currentServiceTier, next)
 

@@ -133,6 +133,7 @@ export const ja = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT には ELEVENLABS_API_KEY が必要です。',
       elevenLabsRejectedKey: 'ElevenLabs が API キーを拒否しました (401)。',
+      gatewayAuthFailed: 'ゲートウェイ認証に失敗しました — API_SERVER_KEY を確認してください。',
       methodNotAllowed:
         'デスクトップバックエンドがそのリクエストを拒否しました (405 Method Not Allowed)。Hermes Desktop を再起動してください。',
       microphonePermission: 'マイクのアクセス許可が拒否されました。',
@@ -169,13 +170,23 @@ export const ja = defineLocale({
       turnDoneBody: '応答の準備ができました。',
       turnErrorTitle: 'ターンが失敗しました',
       backgroundDoneTitle: 'バックグラウンドタスクが完了しました',
-      backgroundFailedTitle: 'バックグラウンドタスクが失敗しました'
+      backgroundFailedTitle: 'バックグラウンドタスクが失敗しました',
+      creditsTitle: 'クレジット'
     }
   },
 
   remoteDisplayBanner: {
     message: reason =>
       `ソフトウェアレンダリングが有効です — リモートディスプレイを検出しました（${reason}）。ちらつきを防ぐため GPU アクセラレーションは無効化されています。`
+  },
+
+  billingBlock: {
+    titleNous: 'Nous クレジットが不足しています',
+    titleProvider: provider => `クレジット不足 — ${provider}`,
+    fallbackMessage: 'アカウントのクレジットが不足しています。続行するにはクレジットを追加してください。',
+    openBilling: '請求を開く',
+    addCredits: 'クレジットを追加',
+    dismiss: '閉じる'
   },
 
   titlebar: {
@@ -253,6 +264,10 @@ export const ja = defineLocale({
         backgroundDone: {
           label: 'バックグラウンドタスク完了',
           description: 'バックグラウンドのターミナルコマンドが完了しました。'
+        },
+        credits: {
+          label: 'クレジット通知',
+          description: 'クレジットの利用が停止または復旧しました。'
         }
       },
       test: 'テスト通知を送信',
@@ -635,6 +650,16 @@ export const ja = defineLocale({
       keepAwakeTitle: 'コンピューターをスリープさせない',
       keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。'
     },
+    quickEntry: {
+      enabledTitle: 'クイック入力',
+      enabledDesc:
+        'グローバルショートカットで小さな入力欄をどこからでも呼び出し、Hermes を開かずにプロンプトを送信します。',
+      shortcutTitle: 'クイック入力のショートカット',
+      shortcutDesc: '修飾キーが 1 つ以上必要です（例: CommandOrControl+Shift+Space）。',
+      active: 'ショートカットは有効です。',
+      takenBy: 'このショートカットは他のアプリが使用しています。別のものを選んでください。',
+      invalidShortcut: '有効なショートカットではありません。修飾キーを 1 つ以上含めてください。'
+    },
     credentials: {
       pasteKey: 'キーを貼り付け',
       pasteLabelKey: label => `${label} キーを貼り付け`,
@@ -668,13 +693,15 @@ export const ja = defineLocale({
       allProfiles: 'すべてのプロファイル',
       defaultConnection: '独自のオーバーライドがないすべてのプロファイルのデフォルト接続。',
       profileConnection: profile =>
-        `"${profile}" がアクティブプロファイルのときのみ使用される接続。ローカルに設定するとデフォルトを継承します。`,
+        `"${profile}" がアクティブプロファイルのときのみ使用される接続。「デフォルトゲートウェイを使用」を選ぶとオーバーライドが削除されます。`,
       envOverrideTitle: '環境変数がこのデスクトップセッションを制御しています。',
       envOverrideDesc:
         '保存された設定を使用するには HERMES_DESKTOP_REMOTE_URL と HERMES_DESKTOP_REMOTE_TOKEN の設定を解除してください。',
       localTitle: 'ローカルゲートウェイ',
       localDesc:
         'ローカルホストでプライベートな Hermes バックエンドを起動します。これがデフォルトで、オフラインでも動作します。',
+      inheritTitle: 'デフォルトゲートウェイを使用',
+      inheritDesc: 'このプロファイルのオーバーライドを削除し、デフォルト接続を使用します。',
       remoteTitle: 'リモートゲートウェイ',
       remoteDesc:
         'このデスクトップシェルをリモートの Hermes バックエンドに接続します。ホスト型ゲートウェイは OAuth またはユーザー名とパスワードを使用します。自己ホスト型はセッショントークンを使用する場合があります。',
@@ -875,6 +902,12 @@ export const ja = defineLocale({
       messages: count => `${count} 件のメッセージ`,
       restored: '復元しました',
       deleteConfirm: title => `"${title}" を完全に削除しますか？この操作は元に戻せません。`,
+      autoArchiveTitle: '古いチャットを自動アーカイブ',
+      autoArchiveDesc:
+        'しばらく操作していないチャットを自動的にアーカイブします。ピン留めしたチャットはアーカイブされず、削除もされません。アーカイブされたチャットはここに移動します。',
+      autoArchiveDaysLabel: 'アーカイブまでの日数',
+      autoArchiveDaysUnit: '日間操作なし',
+      autoArchiveFailed: '自動アーカイブを更新できませんでした',
       defaultDirTitle: 'デフォルトのプロジェクトディレクトリ',
       defaultDirDesc:
         '別のフォルダーを選択しない限り、新しいセッションはこのフォルダーで開始します。未設定の場合はホームディレクトリが使用されます。',
@@ -1057,6 +1090,7 @@ export const ja = defineLocale({
     ageSeconds: seconds => `${seconds}秒前`,
     ageMinutes: minutes => `${minutes}分前`,
     ageHours: hours => `${hours}時間前`,
+    ageDays: days => `${days}日前`,
     durationSeconds: seconds => `${seconds}秒`,
     durationMinutes: (minutes, seconds) => `${minutes}分 ${seconds}秒`,
     tokens: value => `${value} トーク`
@@ -1519,6 +1553,7 @@ export const ja = defineLocale({
     promptPlaceholder: '実行ごとにエージェントが行う内容は？',
     frequencyLabel: '頻度',
     deliverLabel: '配信先',
+    deliverNeedsHomeChannel: '先にホームチャンネルを設定してください',
     modelLabel: 'モデル',
     modelDefault: 'デフォルト（グローバルモデル）',
     customScheduleLabel: 'カスタムスケジュール',
@@ -1530,7 +1565,25 @@ export const ja = defineLocale({
     scheduleRequired: 'スケジュールは必須です。',
     scriptOnlyEditHint: 'スクリプトのみのジョブ（AI プロンプトなし）。ジョブ ID:',
     saveChanges: '変更を保存',
-    createAction: 'Cron を作成'
+    createAction: 'Cron を作成',
+    tabs: {
+      jobs: 'ジョブ',
+      blueprints: 'ブレーンプリント'
+    },
+    blueprints: {
+      tab: 'ブレーンプリント',
+      startFrom: '開始点',
+      custom: 'カスタム',
+      subtitle: 'すぐに使える自動化',
+      dialogDesc: '詳細を入力してスケジュールします。',
+      scheduleIt: 'スケジュールする',
+      scheduling: 'スケジュール中...',
+      scheduled: 'ブレーンプリントをスケジュールしました',
+      loading: 'ブレーンプリントを読み込み中...',
+      failedLoad: 'ブレーンプリントの読み込みに失敗しました',
+      emptyTitle: '利用できるブレーンプリントはありません',
+      emptyDesc: 'このバックエンドで利用できる自動化ブレーンプリントはありません。'
+    }
   },
 
   artifacts: {
@@ -1566,6 +1619,29 @@ export const ja = defineLocale({
     chat: 'チャット',
     copyUrl: 'URL をコピー',
     copyPath: 'パスをコピー'
+  },
+
+  artifactCard: {
+    kind: { code: 'コード', html: 'インタラクティブページ', svg: 'グラフィック' },
+    generating: lines => `生成中… ${lines} 行`,
+    versionBadge: count => `${count} 個のバージョン`,
+    open: '開く'
+  },
+
+  artifactPane: {
+    tabFallback: 'アーティファクト',
+    modePreview: 'プレビュー',
+    modeSource: 'ソース',
+    versionOf: (current, total) => `${total} 中 v${current}`,
+    olderVersion: '前のバージョン',
+    newerVersion: '次のバージョン',
+    latest: '最新',
+    copyContent: 'コンテンツをコピー',
+    download: 'ダウンロード',
+    openInBrowser: 'ブラウザで開く',
+    openInBrowserFailed: 'ブラウザで開けませんでした',
+    missingTitle: 'アーティファクトを利用できません',
+    missingBody: 'このアーティファクトはローカルレジストリに存在しません。'
   },
 
   sidebar: {
@@ -1690,6 +1766,13 @@ export const ja = defineLocale({
       ageDay: '日',
       ageHour: '時間',
       ageMin: '分'
+    },
+    dateDivider: {
+      today: '今日の早い時間',
+      yesterday: '昨日',
+      thisWeek: '今週',
+      lastWeek: '先週',
+      thisMonth: '今月'
     }
   },
 
@@ -1830,6 +1913,10 @@ export const ja = defineLocale({
   statusStack: {
     agents: 'エージェント',
     background: count => `バックグラウンド ${count} 件`,
+    goalActive: '目標進行中',
+    goalDone: '目標達成',
+    goalPaused: '目標一時停止中',
+    goalWaiting: '目標待機中',
     subagents: count => `サブエージェント ${count} 件`,
     todos: (done, total) => `タスク ${done}/${total}`,
     running: '実行中',
@@ -1960,6 +2047,43 @@ export const ja = defineLocale({
     viewDocs: 'インストールドキュメントを見る',
     installTo: 'インストール先',
     retryAfterRun: '実行しました — 再試行',
+    setupChoiceTitle: 'Hermes Desktop をセットアップ',
+    setupChoiceDesc:
+      'すでに実行している Hermes ゲートウェイに接続するか、このコンピューターに Hermes をローカルインストールします。',
+    connectExistingTitle: '既存の Hermes に接続',
+    connectExistingShort: '既存環境に接続',
+    connectExistingDesc:
+      'セッショントークンまたはブラウザーサインインでリモートバックエンドを使用します。ローカルインストールは開始されません。',
+    installLocalTitle: 'Hermes をローカルにインストール',
+    installLocalDesc: 'Hermes をダウンロードし、Python 環境を作成して、このコンピューターでバックエンドを実行します。',
+    localStartUnavailable:
+      'ローカルインストールを開始できません。Hermes Desktop を再起動して、もう一度お試しください。',
+    remoteSetupTitle: '既存の Hermes に接続',
+    remoteSetupDesc:
+      'ゲートウェイ URL を入力してください。Hermes Desktop がトークンとブラウザーサインインのどちらが必要かを検出します。',
+    remoteUrlTitle: 'ゲートウェイ URL',
+    remoteUrlDesc: 'Hermes ゲートウェイのベース URL を使用します。リモートの場合は https:// を含めてください。',
+    remoteUrlPlaceholder: 'https://gateway.example.com/hermes',
+    probing: 'ゲートウェイ認証方式を検出中...',
+    probeError: 'その Hermes ゲートウェイに到達できませんでした。',
+    identityProvider: 'ID プロバイダー',
+    authTitle: '認証',
+    authNeedsOauth: provider => `このゲートウェイをテストする前に ${provider} でサインインしてください。`,
+    authSignedIn: 'ブラウザーサインインが完了しました。',
+    connected: '接続済み',
+    signIn: 'サインイン',
+    signInWith: provider => `${provider} でサインイン`,
+    enterUrlFirst: '先にゲートウェイ URL を入力してください。',
+    signInIncomplete: '認証が完了する前にサインインウィンドウが閉じられました。',
+    tokenTitle: 'セッショントークン',
+    tokenDesc: 'リモートゲートウェイの .env ファイルからセッショントークンを貼り付けます。',
+    pasteSessionToken: 'セッショントークンを貼り付け',
+    incompleteSignInTest: 'OAuth で保護されたこのゲートウェイをテストする前にサインインしてください。',
+    incompleteTokenTest: 'このゲートウェイをテストする前にセッショントークンを入力してください。',
+    testConnection: '接続をテスト',
+    testSucceeded: (baseUrl, version) => `${baseUrl}${version ? ` (${version})` : ''} に接続しました。`,
+    applyRemote: '適用して再接続',
+    backToSetup: '戻る',
     failedTitle: 'インストールに失敗しました',
     settingUpTitle: 'Hermes Agent を設定中',
     finishingTitle: '仕上げ中',
@@ -2073,7 +2197,8 @@ export const ja = defineLocale({
     proNeedsSubscription: 'Pro モデルには有料の Nous サブスクリプションが必要です。',
     free: '無料',
     freeTier: '無料プラン',
-    priceTitle: '100 万トークンあたりの入力/出力価格'
+    priceTitle: '100 万トークンあたりの入力/出力価格',
+    wasPrice: '旧価格'
   },
 
   modelVisibility: {
@@ -2092,8 +2217,7 @@ export const ja = defineLocale({
       noModels: 'モデルが見つかりません',
       editModels: 'モデルを編集…',
       refreshModels: 'モデルを更新',
-      fast: '高速',
-      medium: '中'
+      fast: '高速'
     },
     modelOptions: {
       noOptions: 'このモデルにはオプションがありません',
@@ -2351,6 +2475,7 @@ export const ja = defineLocale({
     closeOthers: '他を閉じる',
     closeToRight: '右側を閉じる',
     closeAll: 'すべて閉じる',
+    newSessionTab: '新しいセッションタブ',
     split: dir => `${dir}に分割`,
     move: dir => `${dir}へ移動`,
     dirUp: '上',
@@ -2443,7 +2568,10 @@ export const ja = defineLocale({
       placeholder: '回答を入力…',
       skip: 'スキップ',
       skipped: 'スキップ済み',
-      continueLabel: '続行'
+      continueLabel: '続行',
+      lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
+      lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
+      lateAnswerHint: 'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。'
     },
     tool: {
       code: 'コード',
@@ -2521,6 +2649,11 @@ export const ja = defineLocale({
           done: 'ファイルを一覧表示しました',
           pending: 'ファイルを一覧表示中',
           pendingAction: '一覧表示中'
+        },
+        memory: {
+          done: 'メモリに保存しました',
+          pending: 'メモリに保存中',
+          pendingAction: '保存中'
         },
         patch: {
           done: 'ファイルにパッチを適用しました',
