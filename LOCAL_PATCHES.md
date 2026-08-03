@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-07-27
-> 上游合并: 2026-07-27（已合并 `upstream/main` 的 1285 个新 commits；本地相对上游 94 commits，含本次 merge commit 与本地 patch 历史；`cli.py` 采用上游 500 次默认迭代上限和 deferred tool catalog 展示逻辑；`tests/hermes_cli/test_models_dev_preferred_merge.py` 继续要求 Kimi Coding Plan 使用真实 wire ID `k3`，同时保留 legacy/custom endpoint 隔离断言）
+> 最后更新: 2026-08-03
+> 上游合并: 2026-08-03（已合并 `upstream/main` 的 2163 个新 commits；包含本地补丁逻辑、00-current-local-overlay.patch 重新生成及测试校验）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
