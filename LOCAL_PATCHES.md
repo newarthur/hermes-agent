@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-08-03
-> 上游合并: 2026-08-03（已合并 `upstream/main` 的 2163 个新 commits；包含本地补丁逻辑、00-current-local-overlay.patch 重新生成及测试校验）
+> 最后更新: 2026-08-08
+> 上游合并: 2026-08-08（已合并 `upstream/main` 的 666 个新 commits；本地补丁逻辑全部保留，00-current-local-overlay.patch 重新生成，核心回归 505 passed）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
@@ -365,6 +365,7 @@ PYTHON_BIN=/root/.hermes/hermes-agent/.venv/bin/python \
 
 | 日期 | 说明 |
 |------|------|
+| 2026-08-08 | 合并 `upstream/main` 666 个新 commits（merge-tree 预测 0 文本冲突）；保留本地 Kimi Coding Plan `k3` wire-ID 及端点作用域测试、Gemini CloudCode 兼容、persona model routes、Telegram picker 清理、Kimi fallback；核心回归 505 passed 后重新生成 canonical overlay |
 | 2026-07-27 | 合并 `upstream/main` 1285 个新 commits；解决 `cli.py` 与 `tests/hermes_cli/test_models_dev_preferred_merge.py` 冲突；保留上游 CLI 迭代/tool discovery 改进及本地 Kimi Coding Plan `k3` wire-ID 策略，并重新生成 canonical overlay |
 | 2026-07-13 | 合并 upstream/main 177 个新 commits；解决 `hermes_cli/inventory.py` 与 `hermes_cli/model_switch.py` 冲突；保留 upstream credential-pool 可用性/用户配置模型逻辑及本地 canonical alias 去重；修复 compression provider rebuild 分类和 Telegram enum forum thread metadata；刷新 canonical overlay 与动态验证脚本 |
 | 2026-07-11 | 受控合并 upstream/main 至 `b8880f124`（416 commits）；正式纳入 GPT-5.6 Sol/Terra/Luna 支持；`test_inventory.py` 唯一冲突通过同时保留本地 Kimi 别名去重测试与 upstream `explicit_only` 测试解决；重新生成 canonical overlay |
