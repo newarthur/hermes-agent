@@ -192,3 +192,56 @@ def test_distinct_kimi_china_credential_still_listed(monkeypatch):
     assert slugs.count("kimi-coding") == 1
     assert "kimi" not in slugs          # alias collapsed into the canonical row
     assert "kimi-coding-cn" in slugs    # distinct China endpoint preserved
+
+
+def test_cross_provider_duplicate_models_deduped(monkeypatch):
+    """A model ID listed by both Copilot and its native provider appears once.
+
+    GitHub Copilot re-exposes GPT/Claude IDs that openai-codex/anthropic also
+    list.  The /model menu must keep the native owner (openai-codex for
+    gpt-*, anthropic for claude-*) and drop the Copilot duplicate so the
+    two-step picker never shows the same model twice.
+    """
+    providers = [
+        _make_provider("copilot", models=["gpt-5.4", "gpt-5.4-mini", "claude-sonnet-5"]),
+        _make_provider("anthropic", models=["claude-sonnet-5", "claude-sonnet-4"]),
+        _make_provider("openai-codex", models=["gpt-5.4", "gpt-5.4-mini", "o3"]),
+    ]
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers", lambda **kwargs: providers
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
+    )
+
+    rows = model_switch.list_picker_providers(include_moa=True)
+    by_slug = {row["slug"]: row for row in rows}
+    assert "copilot" not in by_slug  # all its models were duplicates
+    assert by_slug["anthropic"]["models"] == ["claude-sonnet-5", "claude-sonnet-4"]
+    assert by_slug["openai-codex"]["models"] == ["gpt-5.4", "gpt-5.4-mini", "o3"]
+    seen = [str(m).lower() for row in rows for m in row["models"]]
+    assert len(seen) == len(set(seen))
+
+
+def test_cross_provider_duplicate_keeps_copilot_only_models(monkeypatch):
+    """Copilot models without a native owner row stay available.
+
+    If Copilot lists a model no other provider exposes, the duplicate pass
+    must not remove it — the row keeps its unique models.
+    """
+    providers = [
+        _make_provider("copilot", models=["gpt-5.4", "copilot-custom-1"]),
+        _make_provider("openai-codex", models=["gpt-5.4"]),
+    ]
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers", lambda **kwargs: providers
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
+    )
+
+    rows = model_switch.list_picker_providers(include_moa=True)
+    by_slug = {row["slug"]: row for row in rows}
+    assert by_slug["copilot"]["models"] == ["copilot-custom-1"]
+    assert by_slug["openai-codex"]["models"] == ["gpt-5.4"]
+

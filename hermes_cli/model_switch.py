@@ -3251,4 +3251,74 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
-    return filtered
+    deduped = _dedupe_cross_provider_models(filtered)
+    return [
+        p
+        for p in deduped
+        if bool(p.get("models"))
+        or (bool(p.get("is_user_defined")) and bool(p.get("api_url")))
+    ]
+
+
+def _dedupe_cross_provider_models(providers: List[dict]) -> List[dict]:
+    """Drop model IDs duplicated across provider rows in the interactive picker.
+
+    The two-step provider -> model menu should surface each model ID under its
+    native provider only.  GitHub Copilot's catalog re-exposes GPT/Claude IDs
+    that ``openai-codex``/``anthropic`` already list, which made the Telegram
+    ``/model`` menu look duplicated.  Native family owners win:
+
+    - ``claude-*`` -> ``anthropic``
+    - ``gpt-*`` / ``o1-*`` / ``o3-*`` / ``o4-*`` / ``o5-*`` -> ``openai-codex``
+    - ``kimi-*`` -> ``kimi-coding``
+
+    If the native owner row is present, the duplicate in the other row is
+    removed and ``total_models`` updated; otherwise the first occurrence is
+    kept as-is.
+    """
+    def _family_owner(model_id: str) -> str:
+        mid = model_id.lower()
+        if mid.startswith("claude"):
+            return "anthropic"
+        if (
+            mid.startswith("gpt")
+            or mid.startswith("o1")
+            or mid.startswith("o3")
+            or mid.startswith("o4")
+            or mid.startswith("o5")
+        ):
+            return "openai-codex"
+        if mid.startswith("kimi"):
+            return "kimi-coding"
+        return ""
+
+    by_slug = {str(p.get("slug", "")).lower(): p for p in providers}
+    first_seen: Dict[str, str] = {}
+    for p in providers:
+        slug = str(p.get("slug", "")).lower()
+        for model_id in (p.get("models") or []):
+            first_seen.setdefault(str(model_id).strip().lower(), slug)
+
+    for p in providers:
+        slug = str(p.get("slug", "")).lower()
+        kept: List[str] = []
+        for model_id in (p.get("models") or []):
+            key = str(model_id).strip().lower()
+            first = first_seen.get(key, slug)
+            owner = _family_owner(key)
+            if first != slug and owner == slug and first in by_slug:
+                earlier = by_slug[first]
+                earlier["models"] = [
+                    m for m in (earlier.get("models") or [])
+                    if str(m).strip().lower() != key
+                ]
+                earlier["total_models"] = len(earlier["models"])
+                first_seen[key] = slug
+                kept.append(model_id)
+            elif first != slug:
+                continue
+            else:
+                kept.append(model_id)
+        p["models"] = kept
+        p["total_models"] = len(kept)
+    return providers

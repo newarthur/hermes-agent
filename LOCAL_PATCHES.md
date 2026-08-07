@@ -17,6 +17,7 @@
 4. 保留 Telegram model picker 旧消息清理，避免 inline keyboard 堆积。
 5. 保留 Kimi fallback 修复：fallback provider/base_url 指向 Kimi Coding 时必须走 `anthropic_messages`，并保留 run_agent API message rebuild 路径，避免上游重构覆盖本地兼容逻辑。
 6. 保留 Gemini CLI auxiliary compression 路由：`google-gemini-cli` 辅助压缩通过 CloudCode 客户端调用，避免走不兼容的 OpenAI/Anthropic 路径。
+7. 保留 Telegram `/model` picker 跨 provider 去重：GitHub Copilot 与原生 provider 重复暴露的模型（`gpt-*`/`claude-*`/`kimi-*`）只在其原生 provider 行展示，避免菜单出现重复模型按钮。
 
 补充：provider picker 去重、本机 `openai-codex` 策略已合并进 `01-kimi-coding-plan-runtime.patch`，不再单独维护 `03-provider-picker-dedup-and-local-policy.patch`。
 
@@ -366,6 +367,7 @@ PYTHON_BIN=/root/.hermes/hermes-agent/.venv/bin/python \
 | 日期 | 说明 |
 |------|------|
 | 2026-08-08 | 合并 `upstream/main` 666 个新 commits（merge-tree 预测 0 文本冲突）；保留本地 Kimi Coding Plan `k3` wire-ID 及端点作用域测试、Gemini CloudCode 兼容、persona model routes、Telegram picker 清理、Kimi fallback；核心回归 505 passed 后重新生成 canonical overlay |
+| 2026-08-08 | 修复 Telegram `/model` 菜单跨 provider 重复：`hermes_cli/model_switch.py` 新增 `_dedupe_cross_provider_models`（原生归属优先：`gpt-*`→openai-codex、`claude-*`→anthropic、`kimi-*`→kimi-coding），空 provider 行随空模型剔除；新增 2 个回归测试，`test_list_picker_providers` 等 20 passed |
 | 2026-07-27 | 合并 `upstream/main` 1285 个新 commits；解决 `cli.py` 与 `tests/hermes_cli/test_models_dev_preferred_merge.py` 冲突；保留上游 CLI 迭代/tool discovery 改进及本地 Kimi Coding Plan `k3` wire-ID 策略，并重新生成 canonical overlay |
 | 2026-07-13 | 合并 upstream/main 177 个新 commits；解决 `hermes_cli/inventory.py` 与 `hermes_cli/model_switch.py` 冲突；保留 upstream credential-pool 可用性/用户配置模型逻辑及本地 canonical alias 去重；修复 compression provider rebuild 分类和 Telegram enum forum thread metadata；刷新 canonical overlay 与动态验证脚本 |
 | 2026-07-11 | 受控合并 upstream/main 至 `b8880f124`（416 commits）；正式纳入 GPT-5.6 Sol/Terra/Luna 支持；`test_inventory.py` 唯一冲突通过同时保留本地 Kimi 别名去重测试与 upstream `explicit_only` 测试解决；重新生成 canonical overlay |
