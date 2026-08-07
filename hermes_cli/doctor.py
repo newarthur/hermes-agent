@@ -52,6 +52,8 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_CN_API_KEY",
     "GMI_API_KEY",
     "FIREWORKS_API_KEY",
+    "ACTUAL_API_KEY",
+    "ACTUAL_BASE_URL",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY",
@@ -2742,6 +2744,14 @@ def run_doctor(args):
                         pass
     except ImportError:
         pass
+    except Exception:
+        pass
+
+    # Opt-in live backend probes run AFTER all static checks, only with
+    # `hermes doctor --live` (real network calls; bounded + read-only).
+    try:
+        from hermes_cli.doctor_live import maybe_run_live_checks
+        maybe_run_live_checks(args, manual_issues)
     except Exception:
         pass
 

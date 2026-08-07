@@ -297,6 +297,16 @@ export function useSessionActions({
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
+      // A fresh chat takes the screen. Front the workspace — and ONLY that:
+      // `$terminalTakeover` is the terminal's open/closed state in every
+      // layout, not a Focus-only overlay flag, so clearing it here would close
+      // a terminal sitting harmlessly in its own zone (Default, Terminal deck,
+      // Quad) and would persist a `false` that leaves the Focus tab unable to
+      // mount its workspace on the next boot. Behind another tab the terminal
+      // is hidden, not closed: it keeps its PTYs and the overlay stops
+      // painting on the pane-hidden marker, which is what actually cleared the
+      // chat.
+      revealTreePane('workspace')
       // Clear the durable route intent synchronously, before React Router
       // publishes /new. Submit uses that intent to heal an existing-session
       // rebind race, so leaving the old id here could revive it on a very fast
@@ -700,7 +710,8 @@ export function useSessionActions({
             try {
               activated = await requestGateway<SessionResumeResponse>('session.activate', {
                 session_id: cachedRuntimeId,
-                cols: 96
+                cols: 96,
+                omit_messages: true
               })
             } catch (error) {
               // Compatibility for older backends. Modern backends require
@@ -866,12 +877,14 @@ export function useSessionActions({
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          // REST is the transcript authority for Desktop. Avoid duplicating a
+          // potentially huge compression lineage in the WebSocket response.
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
           // (MCP discovery / prompt build), and the agent pre-warms in the
           // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : {}),
+          ...(watchWindow ? { lazy: true } : { omit_messages: true }),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
 

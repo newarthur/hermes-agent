@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -25,6 +25,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    escape_like as _escape_like,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -34,6 +35,36 @@ logger = logging.getLogger("hermes_state")
 
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
+
+    _SEARCH_MESSAGE_RESULT_FIELDS = (
+        "id",
+        "session_id",
+        "role",
+        "snippet",
+        "timestamp",
+        "tool_name",
+        "source",
+        "model",
+        "session_started",
+        "context",
+    )
+
+    @classmethod
+    def _search_message_fields(
+        cls, fields: Optional[Collection[str]]
+    ) -> Optional[Tuple[str, ...]]:
+        """Validate and canonically order an optional result projection."""
+        if fields is None:
+            return None
+        if isinstance(fields, str):
+            raise TypeError("search fields must be a collection of field names, not a string")
+        requested = set(fields)
+        unknown = requested.difference(cls._SEARCH_MESSAGE_RESULT_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown search result field(s): {', '.join(sorted(unknown))}")
+        return tuple(
+            field for field in cls._SEARCH_MESSAGE_RESULT_FIELDS if field in requested
+        )
 
     def _try_incremental_merge_fts(self) -> None:
         """Run one bounded FTS5 merge pass without failing the completed write."""
@@ -85,7 +116,16 @@ class SessionSearchMixin:
         trigger activation): re-index any row near the boundary that the
         index is missing. docsize has one row per indexed doc, so the
         anti-join is exact and runs on a narrow id range.
+
+        The trigram half of the sweep is gated on ``self._trigram_available``
+        for the same reason ``fts_rebuild_step()`` gates its backfill INSERT:
+        when the SQLite build has no trigram tokenizer (or the table was
+        never created), an unconditional INSERT raises ``no such table``
+        and aborts the whole rebuild — taking ``optimize_fts_storage()``
+        down with it.
         """
+        include_trigram = self._trigram_available
+
         def _do(conn):
             hw_row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
@@ -102,14 +142,15 @@ class SessionSearchMixin:
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
-                conn.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
-                    (lo, hi),
-                )
+                if include_trigram:
+                    conn.execute(
+                        "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
+                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        "FROM messages m "
+                        "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                        "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
+                        (lo, hi),
+                    )
             conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
@@ -123,6 +164,16 @@ class SessionSearchMixin:
         The trash tables are PLAIN tables (their vtable parent was demoted
         away during the migration), so chunked DELETE + final DROP involve
         no FTS5 machinery at all. Returns True while teardown work remains.
+
+        Single-column-key trash tables (the common shape — FTS shadow
+        tables carry a rowid/integer PK) are drained with a high-water
+        marker mirroring :meth:`fts_rebuild_step`: each chunk deletes only
+        rows after the previously-drained key, so the per-chunk scan is
+        bounded instead of re-scanning from the start of the table every
+        chunk (O(n²) total on large trash tables, #79324). Compound-key
+        trash tables (multi-column PK) cannot use a scalar high-water
+        comparison, so they keep the legacy chunked ``LIMIT`` delete —
+        those shadow tables are small by construction.
         """
         with self._lock:
             trash = [
@@ -138,11 +189,62 @@ class SessionSearchMixin:
         tbl = trash[0]
 
         def _do(conn):
-            pk_cols = [
-                r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")
+            pk_info = [
+                (r[1], (r[2] or "").upper())
+                for r in conn.execute(f"PRAGMA table_info({tbl})")
                 if r[5] > 0
             ]
+            pk_cols = [name for name, _typ in pk_info]
             key = ", ".join(pk_cols) if pk_cols else "rowid"
+
+            if len(pk_cols) == 1 and (not pk_info or pk_info[0][1] == "INTEGER"):
+                # High-water drain: delete only rows past the marker key.
+                # The marker is read/written inside the same BEGIN IMMEDIATE
+                # transaction as the DELETE, so concurrent callers claim
+                # disjoint key ranges instead of re-deleting. Only integer
+                # PKs can anchor a numeric high-water comparison — the FTS
+                # config shadow table (TEXT pk like 'version') falls back to
+                # the legacy chunked delete below.
+                marker_key = f"fts_teardown_{tbl}_progress"
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (marker_key,),
+                ).fetchone()
+                high_water = int(row[0]) if row is not None else 0
+
+                # Claim the chunk's upper bound: the LAST row of the
+                # LIMIT window, so a full chunk is deleted per step.
+                upper_rows = conn.execute(
+                    f"SELECT {key} FROM {tbl} WHERE {key} > ? "
+                    f"ORDER BY {key} LIMIT {self._FTS_REBUILD_CHUNK_ROWS}",
+                    (high_water,),
+                ).fetchall()
+                if not upper_rows:
+                    # Drained — the DROP is cheap now.
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    logger.info("Old FTS shadow table %s torn down.", tbl)
+                    return True
+
+                upper = upper_rows[-1][0]
+                cur = conn.execute(
+                    f"DELETE FROM {tbl} WHERE {key} > ? AND {key} <= ?",
+                    (high_water, upper),
+                )
+                if cur.rowcount > 0:
+                    conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (marker_key, str(upper)),
+                    )
+                return True
+
+            # Compound-key or rowid trash table: legacy chunked delete.
+            # These shadow tables are small, so the quadratic re-scan is
+            # not a concern (#79324 keeps the high-water path for the big
+            # single-key tables).
             cur = conn.execute(
                 f"DELETE FROM {tbl} WHERE ({key}) IN "
                 f"(SELECT {key} FROM {tbl} LIMIT {self._FTS_REBUILD_CHUNK_ROWS})"
@@ -1001,19 +1103,33 @@ class SessionSearchMixin:
         active_clause = "" if include_inactive else " AND active = 1"
         # Match CLI/desktop: only real user turns, not timeline bookkeeping.
         display_clause = " AND (display_kind IS NULL OR display_kind = '')"
+        # Legacy standalone compaction handoffs (persisted pre-#80622) are
+        # durable role='user' rows with NO display_kind — SQL can't see them,
+        # so fetch with headroom and drop them in the decode loop below.
+        # Without this, /undo N and rewind pair an in-memory count that
+        # excludes handoffs with a DB pick that includes them, soft-deleting
+        # the wrong turn.
+        fetch_limit = int(limit) * 2 + 5
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, timestamp, content FROM messages "
                 "WHERE session_id = ? AND role = 'user'"
                 f"{active_clause}{display_clause} "
                 "ORDER BY id DESC LIMIT ?",
-                (session_id, int(limit)),
+                (session_id, fetch_limit),
             )
             rows = cursor.fetchall()
 
+        from agent.context_compressor import ContextCompressor
+
         result: List[Dict[str, Any]] = []
         for row in rows:
+            if len(result) >= int(limit):
+                break
             decoded = self._decode_content(row["content"])
+            if ContextCompressor._is_context_summary_content(decoded):
+                # Compaction handoff — never a user-originated turn (#80622).
+                continue
             if isinstance(decoded, list):
                 # Multimodal — flatten text parts.
                 text_parts = [
@@ -1274,6 +1390,7 @@ class SessionSearchMixin:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        fields: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -1295,6 +1412,7 @@ class SessionSearchMixin:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+                fields=fields,
             )
             return rows
         finally:
@@ -1344,6 +1462,7 @@ class SessionSearchMixin:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        fields: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1356,6 +1475,9 @@ class SessionSearchMixin:
 
         Returns matching messages with session metadata, content snippet,
         and surrounding context (1 message before and after the match).
+        ``fields`` selects a result projection; omitting it preserves the
+        complete legacy result. Context is only loaded when that projection
+        consumes it.
 
         ``sort`` controls temporal ordering:
           - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
@@ -1373,6 +1495,8 @@ class SessionSearchMixin:
         pre-compaction transcript stays discoverable after in-place compaction
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
         """
+        result_fields = self._search_message_fields(fields)
+
         if not self._fts_enabled:
             return []
 
@@ -1458,6 +1582,7 @@ class SessionSearchMixin:
         # (indexed substring matching with ranking and snippets).  For shorter
         # CJK queries (1-2 chars), trigram can't match (it needs ≥9 UTF-8
         # bytes = 3 CJK chars), so we fall back to LIKE.
+        matches: List[Dict[str, Any]] = []
         is_cjk = self._contains_cjk(query)
         if is_cjk:
             raw_query = query.strip('"').strip()
@@ -1681,7 +1806,7 @@ class SessionSearchMixin:
                 token_clauses = []
                 like_params: list = []
                 for tok in non_op_tokens:
-                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    esc = _escape_like(tok)
                     token_clauses.append(
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
@@ -1821,10 +1946,14 @@ class SessionSearchMixin:
                 if tri_matches:
                     matches = tri_matches
 
-        # Add surrounding context (1 message before + after each match).
-        # Each query takes its own fresh read transaction via _read_ctx, so
-        # we never hold a lock across N sequential queries.
-        for match in matches:
+        # Add surrounding context (1 message before + after each match) only
+        # when the selected result projection consumes it. Each query takes
+        # its own fresh read transaction via _read_ctx, so we never hold a
+        # lock across N sequential queries.
+        context_matches = (
+            matches if result_fields is None or "context" in result_fields else ()
+        )
+        for match in context_matches:
             try:
                 with self._read_ctx() as conn:
                     ctx_cursor = conn.execute(
@@ -1888,6 +2017,12 @@ class SessionSearchMixin:
         for match in matches:
             match.pop("content", None)
 
+        if result_fields is not None:
+            matches = [
+                {field: match[field] for field in result_fields if field in match}
+                for match in matches
+            ]
+
         return matches
 
     def _search_unindexed_gap(
@@ -1927,7 +2062,7 @@ class SessionSearchMixin:
         where = ["m.id > ? AND m.id <= ?"]
         params: list = [progress, high_water]
         for term in terms:
-            esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            esc = _escape_like(term)
             where.append(
                 "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"

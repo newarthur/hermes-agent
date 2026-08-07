@@ -509,6 +509,9 @@ _PROVIDER_ALIASES = {
     "moonshot-cn": "kimi-coding-cn",
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
+    "actual-computer": "actual",
+    "actualcomputer": "actual",
+    "aci": "actual",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
@@ -1316,6 +1319,7 @@ class _CodexCompletionsAdapter:
         # out of cache-key routing entirely — for those hosts, skip it here.
         try:
             from agent.transports.codex import (
+                _cache_scope_from_session_id,
                 _content_cache_key,
                 _default_prompt_cache_retention_for_request,
             )
@@ -1328,7 +1332,15 @@ class _CodexCompletionsAdapter:
                 or base_url_host_matches(_host_src, "models.github.ai")
             )
             if not _is_xai and not _is_github and "prompt_cache_key" not in resp_kwargs:
-                _cache_key = _content_cache_key(instructions, resp_kwargs.get("tools"))
+                # Scope by the owning turn's session so two unrelated sessions
+                # with the same instructions/tools (e.g. compression, MoA,
+                # flush_memories firing back-to-back on different sessions)
+                # don't bucket-share a prompt cache slot (#78941). The main
+                # transport (agent/transports/codex.py::build_kwargs) does the
+                # same; this adapter had no session handle before
+                # set_runtime_main() started threading one through.
+                _scope = _cache_scope_from_session_id(_runtime_main_value("session_id"))
+                _cache_key = _content_cache_key(instructions, resp_kwargs.get("tools"), _scope)
                 if _cache_key:
                     resp_kwargs["prompt_cache_key"] = _cache_key
             if "prompt_cache_retention" not in resp_kwargs:
@@ -2851,6 +2863,7 @@ def _relay_auxiliary_call(callback):
             "attempt_count": 0,
             "provider": "",
             "model": "",
+            "response_model": None,
             "api_mode": "chat_completions",
         })
         try:
@@ -2876,6 +2889,7 @@ def _relay_auxiliary_call_async(callback):
             "attempt_count": 0,
             "provider": "",
             "model": "",
+            "response_model": None,
             "api_mode": "chat_completions",
         })
         try:
@@ -2899,6 +2913,7 @@ def _set_relay_auxiliary_route(
         return
     context["provider"] = str(provider or "auxiliary")
     context["model"] = str(model or "unknown")
+    context["response_model"] = None
     context["api_mode"] = str(api_mode or "chat_completions")
 
 
@@ -3046,6 +3061,7 @@ def set_runtime_main(
     api_key: Any = "",
     api_mode: str = "",
     auth_mode: str = "",
+    session_id: str = "",
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3067,6 +3083,7 @@ def set_runtime_main(
         ),
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
+        "session_id": (session_id or "").strip(),
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -4264,7 +4281,7 @@ def _retry_same_provider_sync(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
-        _, retry_client, retry_model = resolve_vision_provider_client(
+        effective_provider, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
             base_url=resolved_base_url,
@@ -4280,6 +4297,9 @@ def _retry_same_provider_sync(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
+        effective_provider = _effective_provider_for_client(
+            retry_client, resolved_provider,
+        )
     if retry_client is None:
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
@@ -4287,7 +4307,7 @@ def _retry_same_provider_sync(
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
-        resolved_provider,
+        effective_provider or resolved_provider,
         retry_model or final_model,
         messages,
         temperature=temperature,
@@ -4336,7 +4356,7 @@ async def _retry_same_provider_async(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
-        _, retry_client, retry_model = resolve_vision_provider_client(
+        effective_provider, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
             base_url=resolved_base_url,
@@ -4352,6 +4372,9 @@ async def _retry_same_provider_async(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
         )
+        effective_provider = _effective_provider_for_client(
+            retry_client, resolved_provider,
+        )
     if retry_client is None:
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
@@ -4359,7 +4382,7 @@ async def _retry_same_provider_async(
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
-        resolved_provider,
+        effective_provider or resolved_provider,
         retry_model or final_model,
         messages,
         temperature=temperature,
@@ -5371,11 +5394,11 @@ def _resolve_single_provider(
     )
     return client
 
-def _resolve_auto(
+def _resolve_auto_route(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
-) -> Tuple[Optional[OpenAI], Optional[str]]:
-    """Full auto-detection chain.
+) -> Tuple[Optional[OpenAI], Optional[str], str]:
+    """Full auto-detection chain, including the selected provider identity.
 
     Priority:
       1. User's main provider + main model, regardless of provider type.
@@ -5512,7 +5535,7 @@ def _resolve_auto(
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
-                return client, resolved or main_model
+                return client, resolved or main_model, resolved_provider
 
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
@@ -5520,14 +5543,14 @@ def _resolve_auto(
     # hardcoded provider discovery chain below is only the convenience default
     # for users who have not declared a fallback policy.
     if task:
-        fb_client, fb_model, _fb_label = _try_configured_fallback_chain(
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
-            return fb_client, fb_model
-    fb_client, fb_model, _fb_label = _try_main_fallback_chain(
+            return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+    fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
-        return fb_client, fb_model
+        return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []
@@ -5543,13 +5566,43 @@ def _resolve_auto(
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model
+            return client, model, label
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
                    "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
                    ", ".join(tried))
-    return None, None
+    return None, None, ""
+
+
+def _resolve_auto(
+    main_runtime: Optional[Dict[str, Any]] = None,
+    task: Optional[str] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
+    """Backward-compatible auto resolver for callers that only need client/model."""
+    client, model, _provider = _resolve_auto_route(main_runtime=main_runtime, task=task)
+    return client, model
+
+
+def _tag_effective_provider(client: Any, provider: str) -> None:
+    """Retain auto-routing identity on the client that survives cache reuse."""
+    if client is None or not provider:
+        return
+    try:
+        setattr(client, "_hermes_aux_effective_provider", provider)
+    except (AttributeError, TypeError):
+        logger.debug(
+            "Auxiliary client %s cannot retain effective provider %s",
+            type(client).__name__, provider,
+        )
+
+
+def _effective_provider_for_client(client: Any, fallback: str) -> str:
+    """Return the concrete provider selected for an auto-routed client."""
+    effective_provider = getattr(client, "_hermes_aux_effective_provider", "")
+    if isinstance(effective_provider, str) and effective_provider:
+        return effective_provider
+    return str(fallback or "")
 
 
 # ── Centralized Provider Router ─────────────────────────────────────────────
@@ -5788,6 +5841,8 @@ def resolve_provider_client(
             return False
         if raw_codex:
             return False
+        if provider == "actual":
+            return True
         if api_mode == "codex_responses":
             return True
         # Auto-detect: api.openai.com + codex model name pattern
@@ -5828,7 +5883,10 @@ def resolve_provider_client(
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
-        client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
+        client, resolved, effective_provider = _resolve_auto_route(
+            main_runtime=main_runtime,
+            task=task,
+        )
         if client is None:
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
@@ -5841,8 +5899,12 @@ def resolve_provider_client(
                 "auxiliary provider (using %r instead)", model, resolved)
             model = None
         final_model = model or resolved
-        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                else (client, final_model))
+        routed_client, routed_model = (
+            _to_async_client(client, final_model, is_vision=is_vision)
+            if async_mode else (client, final_model)
+        )
+        _tag_effective_provider(routed_client, effective_provider)
+        return routed_client, routed_model
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
@@ -6205,6 +6267,22 @@ def resolve_provider_client(
         # credential is registered for this provider alias.
         if explicit_api_key:
             api_key = explicit_api_key.strip() or api_key
+        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        if explicit_base_url:
+            raw_base_url = explicit_base_url.strip().rstrip("/")
+        if provider == "actual":
+            try:
+                from hermes_cli.auth import (
+                    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER,
+                    is_actual_local_base_url,
+                    normalize_actual_base_url,
+                )
+
+                raw_base_url = normalize_actual_base_url(raw_base_url)
+                if not api_key and is_actual_local_base_url(raw_base_url):
+                    api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
+            except Exception:
+                pass
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
@@ -6214,7 +6292,6 @@ def resolve_provider_client(
                          provider, ", ".join(tried_sources))
             return None, None
 
-        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         base_url = _to_openai_base_url(raw_base_url)
         # Honour an explicit base_url override from the caller — used when a
         # fallback_model entry (or custom_providers lookup) routes through a
@@ -7635,6 +7712,77 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Per-task concurrency limiting (#23324)
+# ---------------------------------------------------------------------------
+# Background auxiliary work (title generation, context compression, etc.) can
+# spawn unbounded concurrent LLM calls when many sessions are active. During
+# provider incidents each call also retries / fans out across the fallback
+# chain, multiplying request volume on already-degraded endpoints. A per-task
+# semaphore caps in-flight calls so retry amplification stays bounded.
+
+_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
+_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_sem_lock = threading.Lock()
+
+
+def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
+    """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
+    if not task or task == "vision":
+        # Vision already uses this key for its encode/resize CPU worker pool;
+        # its LLM calls deliberately remain concurrent.
+        return None
+    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
+    """Get a per-task sync semaphore, rebuilding it after a config change."""
+    limit = _get_task_max_concurrency(task)
+    if limit is None:
+        return None
+    with _aux_sem_lock:
+        entry = _aux_sync_semaphores.get(task)
+        if entry is None or entry[0] != limit:
+            semaphore = threading.BoundedSemaphore(limit)
+            _aux_sync_semaphores[task] = (limit, semaphore)
+            return semaphore
+        return entry[1]
+
+
+def _acquire_async_aux_semaphore(task: Optional[str]):
+    """Get a per-task, per-event-loop async semaphore after config lookup."""
+    limit = _get_task_max_concurrency(task)
+    if limit is None:
+        return None
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (task, id(loop))
+    with _aux_sem_lock:
+        entry = _aux_async_semaphores.get(key)
+        if entry is None or entry[0] != limit:
+            semaphore = asyncio.Semaphore(limit)
+            _aux_async_semaphores[key] = (limit, semaphore)
+            return semaphore
+        return entry[1]
+
+
+def _reset_aux_semaphores() -> None:
+    """Drop cached semaphores (test helper)."""
+    with _aux_sem_lock:
+        _aux_sync_semaphores.clear()
+        _aux_async_semaphores.clear()
+
+
+# ---------------------------------------------------------------------------
 # Anthropic-compatible endpoint detection + image block conversion
 # ---------------------------------------------------------------------------
 
@@ -8032,6 +8180,7 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
+            _record_relay_auxiliary_response_model(response)
             _complete_relay_auxiliary_call()
             return recovered
         response_type = type(response).__name__
@@ -8042,6 +8191,7 @@ def _validate_llm_response(
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
+    _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
 
@@ -8056,7 +8206,23 @@ def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
     relay_llm.complete_logical_call(
         str(context.get("request_id") or ""),
         outcome=outcome,
+        model_name=str(context.get("model") or "unknown"),
+        provider_name=str(context.get("provider") or "auxiliary"),
+        response_model_name=context.get("response_model"),
     )
+
+
+def _record_relay_auxiliary_response_model(response: Any) -> None:
+    """Retain the provider-reported model for terminal route attribution."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return
+    if isinstance(response, dict):
+        model = response.get("model")
+    else:
+        model = getattr(response, "model", None)
+    if isinstance(model, str) and model.strip():
+        context["response_model"] = model
 
 
 def _fail_relay_auxiliary_call() -> None:
@@ -8489,6 +8655,75 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
 ) -> Any:
+    """Run an auxiliary LLM request, applying the configured task limit."""
+    semaphore = _acquire_sync_aux_semaphore(task)
+    if semaphore is not None:
+        semaphore.acquire()
+    try:
+        response = _call_llm_impl(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            reasoning_config=reasoning_config,
+            extra_headers=extra_headers,
+            api_mode=api_mode,
+            stream=stream,
+            stream_options=stream_options,
+        )
+        if stream and semaphore is not None:
+            stream_semaphore = semaphore
+            semaphore = None
+            return _release_sync_semaphore_after_stream(response, stream_semaphore)
+        return response
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+def _release_sync_semaphore_after_stream(
+    stream: Any, semaphore: threading.BoundedSemaphore,
+):
+    """Release a permit only after a streaming response is consumed or closed."""
+    try:
+        yield from stream
+    finally:
+        try:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        finally:
+            semaphore.release()
+
+
+def _call_llm_impl(
+    task: str = None,
+    *,
+    provider: str = None,
+    model: str = None,
+    base_url: str = None,
+    api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: int = None,
+    tools: list = None,
+    timeout: float = None,
+    extra_body: dict = None,
+    reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    api_mode: str = None,
+    stream: bool = False,
+    stream_options: dict = None,
+) -> Any:
     """Centralized synchronous LLM call.
 
     Resolves provider + model (from task config, explicit args, or auto-detect),
@@ -8538,6 +8773,7 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    effective_provider = resolved_provider
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -8574,6 +8810,9 @@ def call_llm(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
+        effective_provider = _effective_provider_for_client(
+            client, resolved_provider,
+        )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
@@ -8588,6 +8827,7 @@ def call_llm(
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
+                    effective_provider = resolved_provider
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -8602,15 +8842,21 @@ def call_llm(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto", main_runtime=main_runtime, task=task,
+                )
+                effective_provider = _effective_provider_for_client(
+                    client, "auto",
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
-        resolved_provider,
+        request_provider,
         final_model,
         resolved_api_mode,
     )
@@ -8619,14 +8865,14 @@ def call_llm(
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
+                     task, request_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
@@ -8636,7 +8882,7 @@ def call_llm(
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
@@ -8664,7 +8910,7 @@ def call_llm(
         return _relay_sync_stream(
             client,
             kwargs,
-            provider=resolved_provider,
+            provider=request_provider,
             api_mode=resolved_api_mode,
         )
 
@@ -8692,19 +8938,19 @@ def call_llm(
                 _relay_sync_completion(
                     client,
                     kwargs,
-                    provider=resolved_provider,
+                    provider=request_provider,
                     api_mode=resolved_api_mode,
                     create=lambda request: _create_with_progress(
                         client,
                         request,
                         task,
                         force_stream=_provider_requires_stream(
-                            resolved_provider, _base_info or resolved_base_url,
+                            request_provider, _base_info or resolved_base_url,
                         ),
                     ),
                 ),
                 task,
-                provider=resolved_provider, base_url=_base_info)
+                provider=request_provider, base_url=_base_info)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -8739,14 +8985,14 @@ def call_llm(
                         _relay_sync_completion(
                             client,
                             kwargs,
-                            provider=resolved_provider,
+                            provider=request_provider,
                             api_mode=resolved_api_mode,
                             create=lambda request: _create_with_progress(
                                 client,
                                 request,
                                 task,
                                 force_stream=_provider_requires_stream(
-                                    resolved_provider,
+                                    request_provider,
                                     _base_info or resolved_base_url,
                                 ),
                             ),
@@ -9252,6 +9498,47 @@ async def async_call_llm(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
 ) -> Any:
+    """Run an asynchronous auxiliary LLM request under the configured limit."""
+    semaphore = _acquire_async_aux_semaphore(task)
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        return await _async_call_llm_impl(
+            task=task,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=timeout,
+            extra_body=extra_body,
+            reasoning_config=reasoning_config,
+        )
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+async def _async_call_llm_impl(
+    task: str = None,
+    *,
+    provider: str = None,
+    model: str = None,
+    base_url: str = None,
+    api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: int = None,
+    tools: list = None,
+    timeout: float = None,
+    extra_body: dict = None,
+    reasoning_config: Optional[dict] = None,
+) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
@@ -9263,6 +9550,7 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    effective_provider = resolved_provider
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -9300,6 +9588,9 @@ async def async_call_llm(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
+        effective_provider = _effective_provider_for_client(
+            client, resolved_provider,
+        )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
@@ -9311,6 +9602,7 @@ async def async_call_llm(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
                     resolved_provider = fb_label or resolved_provider
+                    effective_provider = resolved_provider
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -9320,15 +9612,24 @@ async def async_call_llm(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto",
+                    async_mode=True,
+                    main_runtime=main_runtime,
+                    task=task,
+                )
+                effective_provider = _effective_provider_for_client(
+                    client, "auto",
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
-        resolved_provider,
+        request_provider,
         final_model,
         resolved_api_mode,
     )
@@ -9338,14 +9639,14 @@ async def async_call_llm(
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
@@ -9354,7 +9655,7 @@ async def async_call_llm(
         # for the rationale. (PR #16587)
         _force_stream_async = (
             _provider_requires_stream(
-                resolved_provider, _client_base or resolved_base_url,
+                request_provider, _client_base or resolved_base_url,
             )
             and not isinstance(client, (
                 AsyncCodexAuxiliaryClient,
@@ -9373,12 +9674,12 @@ async def async_call_llm(
                 await _relay_async_completion(
                     client,
                     kwargs,
-                    provider=resolved_provider,
+                    provider=request_provider,
                     api_mode=resolved_api_mode,
                     create=_acreate,
                 ),
                 task,
-                provider=resolved_provider, base_url=_client_base)
+                provider=request_provider, base_url=_client_base)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -9401,7 +9702,7 @@ async def async_call_llm(
                 await _relay_async_completion(
                     client,
                     kwargs,
-                    provider=resolved_provider,
+                    provider=request_provider,
                     api_mode=resolved_api_mode,
                     create=_acreate,
                 ),

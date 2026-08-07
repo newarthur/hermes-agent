@@ -7,8 +7,7 @@ import {
   LIVE_TAIL_PARTS,
   liveTailStart,
   type MessageGroup,
-  messageRenderWeight,
-  RENDER_WEIGHT_CHARS
+  resolveThreadScrollTarget
 } from './list'
 
 // Signature rows are `${index}:${id}:${role}:${weight}` (see the useAuiState
@@ -62,6 +61,53 @@ describe('buildGroups', () => {
   })
 })
 
+describe('resolveThreadScrollTarget', () => {
+  const context = (scrollElement: Pick<HTMLElement, 'scrollTop'>) => ({
+    contentElement: document.createElement('div'),
+    scrollElement: scrollElement as HTMLElement
+  })
+
+  it('settles when the browser clamps the requested bottom within half a CSS pixel', () => {
+    let actualScrollTop = 0
+    let writes = 0
+
+    const scrollElement = {
+      get scrollTop() {
+        return actualScrollTop
+      },
+      set scrollTop(value: number) {
+        writes += 1
+        actualScrollTop = value - 0.125
+      }
+    }
+
+    const target = 899
+
+    const requested = resolveThreadScrollTarget(target, context(scrollElement))
+    scrollElement.scrollTop = requested
+    const settled = resolveThreadScrollTarget(target, context(scrollElement))
+
+    expect(requested).toBe(target)
+    expect(actualScrollTop).toBe(898.875)
+    expect(settled).toBe(actualScrollTop)
+    expect(actualScrollTop < settled).toBe(false)
+    expect(writes).toBe(1)
+  })
+
+  it('keeps following while more than half a CSS pixel remains', () => {
+    const scrollElement = { scrollTop: 898.25 }
+
+    expect(resolveThreadScrollTarget(899, context(scrollElement))).toBe(899)
+  })
+
+  it('re-arms after streaming content increases the target', () => {
+    const scrollElement = { scrollTop: 898.875 }
+
+    expect(resolveThreadScrollTarget(899, context(scrollElement))).toBe(898.875)
+    expect(resolveThreadScrollTarget(999, context(scrollElement))).toBe(999)
+  })
+})
+
 describe('firstVisibleGroupIndex', () => {
   const group = (id: string, weight: number): MessageGroup => ({ id, index: 0, kind: 'standalone', weight })
 
@@ -88,49 +134,19 @@ describe('firstVisibleGroupIndex', () => {
   it('returns groups.length for an empty list', () => {
     expect(firstVisibleGroupIndex([], 60)).toBe(0)
   })
-})
 
-describe('messageRenderWeight', () => {
-  it('charges large text and tool results by character cost, not only part count', () => {
-    const text = [{ type: 'text', text: 'x'.repeat(RENDER_WEIGHT_CHARS * 3) }]
+  it('keeps a floor of turns visible however heavy they are', () => {
+    // Without the floor a session of enormous turns puts "Show earlier" two
+    // turns from the bottom, which reads as broken rather than as paging.
+    const groups = Array.from({ length: 20 }, (_, i) => group(`g${i}`, 5_000))
 
-    const tool = [
-      {
-        type: 'tool-call',
-        toolName: 'skill_view',
-        args: { name: 'hermes-agent' },
-        result: { content: 'x'.repeat(RENDER_WEIGHT_CHARS * 100) }
-      }
-    ]
-
-    expect(messageRenderWeight(text)).toBe(4)
-    expect(messageRenderWeight(tool)).toBeGreaterThanOrEqual(101)
+    expect(firstVisibleGroupIndex(groups, 600, 8)).toBe(groups.length - 8)
   })
 
-  it('makes repeated 51KB tool outputs exceed the normal transcript page', () => {
-    const toolOutput = () => [
-      {
-        type: 'tool-call',
-        toolName: 'skill_view',
-        result: { content: 'x'.repeat(51_236) }
-      }
-    ]
+  it('does not force the floor to hide turns the budget already showed', () => {
+    const groups = Array.from({ length: 20 }, (_, i) => group(`g${i}`, 1))
 
-    const groups = Array.from({ length: 5 }, (_, index) => ({
-      id: `tool-${index}`,
-      index,
-      kind: 'standalone' as const,
-      weight: messageRenderWeight(toolOutput())
-    }))
-
-    expect(firstVisibleGroupIndex(groups, 300)).toBeGreaterThan(0)
-  })
-
-  it('handles circular tool payloads without recursing forever', () => {
-    const result: { content: string; self?: unknown } = { content: 'ok' }
-    result.self = result
-
-    expect(messageRenderWeight([{ type: 'tool-call', result }])).toBe(2)
+    expect(firstVisibleGroupIndex(groups, 600, 8)).toBe(0)
   })
 })
 
