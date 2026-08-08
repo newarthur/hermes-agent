@@ -295,7 +295,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
     "kimi-coding": ProviderConfig(
         id="kimi-coding",
-        name="Kimi / Moonshot",
+        name="Kimi / Kimi Coding Plan",
         auth_type="api_key",
         # Legacy platform.moonshot.ai keys use this endpoint (OpenAI-compat).
         # sk-kimi- (Kimi Code) keys are auto-redirected to api.kimi.com/coding
