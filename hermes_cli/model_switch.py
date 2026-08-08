@@ -2554,6 +2554,13 @@ def list_authenticated_providers(
             _cp_model_ids = cached_provider_model_ids(_cp.slug)
             if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
+        # Google Gemini OAuth: always surface the curated Gemini 3.1 Pro /
+        # 3.6 Flash entries first, then any live Cloud Code Assist IDs, so the
+        # picker never hides the requested models when live discovery differs.
+        if _cp.slug == "google-gemini-cli":
+            _cp_model_ids = list(dict.fromkeys(
+                [*(curated.get(_cp.slug, [])), *_cp_model_ids]
+            ))
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 
@@ -3251,12 +3258,16 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
+    excluded = {str(x).strip().lower() for x in (excluded_providers or [])}
     deduped = _dedupe_cross_provider_models(filtered)
     return [
         p
         for p in deduped
-        if bool(p.get("models"))
-        or (bool(p.get("is_user_defined")) and bool(p.get("api_url")))
+        if str(p.get("slug", "")).lower() not in excluded
+        and (
+            bool(p.get("models"))
+            or (bool(p.get("is_user_defined")) and bool(p.get("api_url")))
+        )
     ]
 
 

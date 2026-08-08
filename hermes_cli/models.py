@@ -419,6 +419,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-v4-pro",
         "deepseek-v4-flash",
     ],
+    "google-gemini-cli": [
+        "gemini-3.1-pro",
+        "gemini-3.6-flash",
+    ],
+
     "xiaomi": [
         "mimo-v2.5-pro",
         "mimo-v2.5",
@@ -1133,6 +1138,8 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
+    ProviderEntry("google-gemini-cli", "Google Gemini (OAuth)",    "Google Gemini (Cloud Code Assist OAuth)"),
+
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),

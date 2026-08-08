@@ -245,3 +245,33 @@ def test_cross_provider_duplicate_keeps_copilot_only_models(monkeypatch):
     assert by_slug["copilot"]["models"] == ["copilot-custom-1"]
     assert by_slug["openai-codex"]["models"] == ["gpt-5.4"]
 
+
+def test_excluded_providers_drop_final_rows_including_moa(monkeypatch):
+    """excluded_providers applies to the final picker payload.
+
+    The virtual MoA row is prepended after the base listing, so the exclusion
+    must be enforced on the returned rows too — not only inside
+    list_authenticated_providers. OpenRouter/Copilot are covered by both.
+    """
+    providers = [
+        _make_provider("openrouter", models=["openai/gpt-5.4"]),
+        _make_provider("copilot", models=["gpt-5.4"]),
+        _make_provider("kimi-coding", models=["k3"]),
+    ]
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers", lambda **kwargs: providers
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
+    )
+
+    rows = model_switch.list_picker_providers(
+        include_moa=True,
+        excluded_providers=["moa", "openrouter", "copilot"],
+    )
+    slugs = [row["slug"] for row in rows]
+    assert "moa" not in slugs
+    assert "openrouter" not in slugs
+    assert "copilot" not in slugs
+    assert slugs == ["kimi-coding"]
+
