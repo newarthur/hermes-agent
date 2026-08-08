@@ -300,7 +300,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         # Legacy platform.moonshot.ai keys use this endpoint (OpenAI-compat).
         # sk-kimi- (Kimi Code) keys are auto-redirected to api.kimi.com/coding
         # by _resolve_kimi_base_url() below.
-        inference_base_url="https://api.moonshot.ai/v1",
+        inference_base_url="https://api.kimi.com/coding",
         api_key_env_vars=("KIMI_API_KEY", "KIMI_CODING_API_KEY"),
         base_url_env_var="KIMI_BASE_URL",
     ),
