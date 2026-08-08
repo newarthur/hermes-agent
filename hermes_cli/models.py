@@ -420,8 +420,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-v4-flash",
     ],
     "google-gemini-cli": [
-        "gemini-3.1-pro",
-        "gemini-3.6-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
     ],
 
     "xiaomi": [
