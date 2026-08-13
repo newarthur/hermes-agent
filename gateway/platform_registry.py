@@ -162,6 +162,31 @@ class PlatformEntry:
     # resolve the default chat/room ID.  Empty = no cron home-channel support.
     cron_deliver_env_var: str = ""
 
+    # ── Target parsing ──
+    # Optional: callable that parses a raw target string for this platform into
+    # a (chat_id, thread_id) tuple, or None if the string is not a recognized
+    # explicit target.  Invoked by ``tools/send_message_tool._parse_target_ref``
+    # before channel-directory fallback so plugin platforms can declare their
+    # own native target syntax (e.g. ``fmsg:@alice@example.com``) without
+    # hard-casing in Hermes core.
+    #
+    # Signature:
+    #     (target_ref: str) -> Optional[tuple[str, Optional[str]]]
+    #
+    # If the callable returns None the target proceeds to channel-directory
+    # resolution. No opaque fallback is applied.
+    parse_target_ref_fn: Optional[Callable[[str], Optional[tuple[str, Optional[str]]]]] = None
+
+    # Optional validation applied after parsing/normalization or
+    # channel-directory resolution. Return True to accept, False to reject, or
+    # a non-empty string to reject with that diagnostic.
+    validate_target_ref_fn: Optional[Callable[[str], bool | str]] = None
+
+    # Optional whole-request handler for custom platform delivery. Receives
+    # (args, normalized_chat_id, platform_name, pconfig) and may be sync/async.
+    # Prefer standalone_sender_fn when the standard send contract is enough.
+    send_message_handler: Optional[Callable[[dict, str, str, Any], Any]] = None
+
     # ── Standalone (out-of-process) sending ──
     # Optional: async coroutine that delivers a message without a live
     # gateway adapter.  Called by ``tools/send_message_tool._send_via_adapter``
@@ -271,7 +296,8 @@ class PlatformRegistry:
     def unregister(self, name: str) -> bool:
         """Remove a platform entry.  Returns True if it existed."""
         self._deferred.pop(name, None)
-        return self._entries.pop(name, None) is not None
+        removed = self._entries.pop(name, None) is not None
+        return removed
 
     def get(self, name: str) -> Optional[PlatformEntry]:
         """Look up a platform entry by name."""

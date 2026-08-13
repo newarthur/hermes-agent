@@ -197,9 +197,12 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   await syncConfiguredDefaultProjectDir()
   const configured = getConfiguredDefaultProjectDir()
 
+  // Transient: each source below is already remembered or comes from config, so
+  // persisting would only promote a configured default into the per-backend
+  // memory of what the user picked.
   const seedLiveCwd = (cwd: string) => {
     if (cwd && !$activeSessionId.get()) {
-      setCurrentCwd(cwd)
+      setCurrentCwdTransient(cwd)
     }
   }
 
@@ -250,6 +253,62 @@ export const sessionMatchesStoredId = (
   session: Pick<SessionInfo, '_lineage_root_id' | 'id'>,
   storedSessionId: string
 ): boolean => session.id === storedSessionId || session._lineage_root_id === storedSessionId
+
+// Alias lookup, memoized per sessions-list reference. `lineageAliases` runs
+// per cached session state per status projection per message delta — an
+// O(sessions) scan there multiplies out to states × sessions × ~30Hz per busy
+// session, which is what made a populated recents list drag every stream. The
+// list is replaced wholesale (never mutated), so its reference is the cache key.
+type LineageRow = Pick<SessionInfo, '_lineage_root_id' | 'id'>
+const lineageIndexBySessions = new WeakMap<readonly LineageRow[], Map<string, string[]>>()
+
+function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
+  const cached = lineageIndexBySessions.get(sessions)
+
+  if (cached) {
+    return cached
+  }
+
+  const index = new Map<string, string[]>()
+
+  const add = (key: string, value: string) => {
+    const bucket = index.get(key)
+
+    if (!bucket) {
+      index.set(key, [value])
+    } else if (!bucket.includes(value)) {
+      bucket.push(value)
+    }
+  }
+
+  for (const session of sessions) {
+    add(session.id, session.id)
+
+    if (session._lineage_root_id) {
+      add(session.id, session._lineage_root_id)
+      add(session._lineage_root_id, session.id)
+      add(session._lineage_root_id, session._lineage_root_id)
+    }
+  }
+
+  lineageIndexBySessions.set(sessions, index)
+
+  return index
+}
+
+/** Every id one conversation answers to: the id we were handed, plus the live
+ *  id and lineage root of each session it resolves to.
+ *
+ *  Status sets are published under a session's CURRENT stored id, but a sidebar
+ *  row, a persisted tile, and the route can each hold a different tip of the
+ *  same lineage after a compression. Publishing every alias lets those surfaces
+ *  keep using a plain membership test instead of each re-deriving lineage —
+ *  and getting it wrong, which reads as a running session going idle mid-turn. */
+export function lineageAliases(storedId: string, sessions: readonly LineageRow[]): string[] {
+  // Every key is in its own bucket by construction, so the bucket IS the
+  // alias set. Copied so no caller can mutate the shared index.
+  return lineageIndex(sessions).get(storedId)?.slice() ?? [storedId]
+}
 
 /** True when two ids name the same conversation across compression tip rotation. */
 export function idsShareLineage(
@@ -450,6 +509,16 @@ export const $messagingTruncated = atom<boolean>(false)
 // "is there another page?" is what pagination actually needs and comes free
 // from the row count the query already returned.
 export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
+
+/** Tokens and spend per profile across ALL its sessions, not just the loaded
+ *  page — summed in SQL so a profile group's header total doesn't move when the
+ *  window does. Keyed by profile name. */
+export interface ProfileUsage {
+  cost_usd: number
+  tokens: number
+}
+
+export const $sessionProfilesUsage = atom<Record<string, ProfileUsage>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -527,6 +596,12 @@ export const $currentCwd = atom(getRememberedWorkspaceCwd())
 // would collapse the workspace panes and drop file-tree state on every switch,
 // so the path stays put and is simply marked as not-yet-owned.
 export const $workspaceCwdOwner = atom<null | string>(null)
+
+// Terminal execution backend (local | docker | ssh | ...) mirrored from the
+// gateway (session.info). Drives attachment upload decisions: container
+// backends have their own filesystem, so a dropped host path must be uploaded
+// as bytes and staged into a bind-mounted cache dir (#76577).
+export const $terminalBackend = atom('')
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
 export const $currentBranch = atom('')
@@ -556,6 +631,8 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
   updateAtom($sessionProfilesTruncated, next)
+export const setSessionProfilesUsage = (next: Updater<Record<string, ProfileUsage>>) =>
+  updateAtom($sessionProfilesUsage, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
@@ -564,6 +641,12 @@ export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStor
 // Transient: a background session finished and the user hasn't opened it since.
 // Written by session-states.ts (handleTransition), cleared here on session open.
 export const $unreadFinishedSessionIds = atom<string[]>([])
+
+export const markAllSessionsRead = () => {
+  if ($unreadFinishedSessionIds.get().length) {
+    $unreadFinishedSessionIds.set([])
+  }
+}
 
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   updateAtom($selectedStoredSessionId, next)
@@ -643,11 +726,26 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
+/** Move the live workspace AND remember it as this backend's workspace.
+ *
+ *  Only for a path the user chose — a folder pick, a project/worktree entry, an
+ *  explicit workspace target. The remembered value is where a new chat starts on
+ *  a remote backend, so writing it from a path the user merely *looked at* makes
+ *  every new chat land in the last session's folder (#77496, #80213). To follow
+ *  a conversation's cwd, use `setCurrentCwdTransient`.
+ */
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
+export const setTerminalBackend = (next: Updater<string>) => updateAtom($terminalBackend, next)
+
+/** Move the live workspace without claiming it as the user's chosen one.
+ *
+ *  For paths that come from a conversation rather than from the user: resume
+ *  settling, a warm switch, the agent relocating mid-turn, detaching a draft.
+ */
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
 
 // Released-ownership marker: the live path belongs to no conversation. `null`
@@ -680,12 +778,12 @@ export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WOR
  *
  *  The single primitive for "this path IS the selected conversation's" — a folder
  *  pick, a project entry, the agent relocating itself. Prefer it over a bare
- *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
- *  held it before; workspace-derived slices then stay hidden even though the
- *  path is correct (#71254).
+ *  `setCurrentCwdTransient`, which moves the path while leaving ownership naming
+ *  whatever held it before; workspace-derived slices then stay hidden even though
+ *  the path is correct (#71254).
  */
 export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
-  setCurrentCwd(cwd)
+  setCurrentCwdTransient(cwd)
   setWorkspaceCwdOwner($selectedStoredSessionId.get())
 }
 

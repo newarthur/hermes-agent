@@ -113,6 +113,11 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # Which desktop window this message was typed into. Rewritten on every
+    # submit, because one session can be driven from the app window and the HUD
+    # in turn: a stale "hud" would tell the model the user is still floating
+    # over another app when they are back in Hermes.
+    session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -157,7 +162,21 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        # confirm_truncate with no target is malformed: the flag is consent for
+        # a specific cut, and a client that sends it bare has leaked rewind
+        # state onto an ordinary submit (#82756). Fail fast instead of quietly
+        # ignoring the flag so the broken client state is surfaced.
+        if is_truthy_value(params.get("confirm_truncate")) and truncate_user_ordinal is None:
+            return _err(
+                rid,
+                4004,
+                "confirm_truncate requires truncate_before_user_ordinal",
+            )
         if truncate_user_ordinal is not None:
+            # bool is an int subclass: a JSON `true` would coerce via int() to
+            # ordinal 1 and aim a confirmed rewind at the second user turn.
+            if isinstance(truncate_user_ordinal, bool):
+                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
@@ -252,8 +271,18 @@ def _(rid, params: dict) -> dict:
                     # class #80216 fixed for /retry. On an uncompacted session
                     # all rows are active=1, so this is behaviorally identical
                     # to the full replace.
+                    # archive_dropped: a rewind overwrites turns the user may
+                    # not have meant to drop, and this write is the last step
+                    # before they are gone — three reported incidents ended
+                    # here with nothing to restore from (#70516, #80763,
+                    # #82756). Soft-archiving keeps them on disk (active=0) and
+                    # in the FTS index, so a mis-aimed cut is recoverable
+                    # instead of terminal. The live transcript is unchanged.
                     db.replace_messages(
-                        session["session_key"], truncated, active_only=True
+                        session["session_key"],
+                        truncated,
+                        active_only=True,
+                        archive_dropped=True,
                     )
                 except Exception as exc:
                     logger.error(
@@ -933,6 +962,15 @@ def _(rid, params: dict) -> dict:
     # `text` is a JSON string of the active preview tab's serialized contents.
     # allow_expired=True for the same reason as terminal.read: the tool's
     # bounded wait can expire while a slow page extraction is still running.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
+@method("window.read.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string describing the OS window underneath the Hermes
+    # window (read_window_below tool). allow_expired=True for the same reason
+    # as terminal.read: the tool's bounded wait can expire while the renderer's
+    # round-trip to the main process is still in flight.
     return _respond(rid, params, "text", allow_expired=True)
 
 
