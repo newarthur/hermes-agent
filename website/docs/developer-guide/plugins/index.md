@@ -223,7 +223,102 @@ requires_env:          # gate loading on env vars; prompted during install
     description: "Key for the Other service"
     url: "https://other.com/keys"
     secret: true
+capabilities:          # privileged host surfaces you request (consent flow)
+  - tools.override     # replace built-in tools (needs user consent)
+  - llm.model_override # choose the model for host-owned LLM calls
 ```
+
+### Declaring capabilities
+
+If your plugin needs a privileged host surface — overriding a built-in tool,
+picking the model for `ctx.llm` calls, etc. — declare it in `capabilities:`.
+At install/enable time the user sees the list and consents once; if a later
+version adds a capability, the update flow asks again for just the addition.
+Undeclared or unconsented capabilities are simply off (fail closed), so
+**probe before using them and degrade gracefully**:
+
+```python
+def register(ctx):
+    if ctx.has_capability("tools.override"):
+        ctx.register_tool(..., override=True)
+    else:
+        ctx.register_tool(...)   # register under a non-conflicting name
+```
+
+Known capability ids: `tools.override`, `llm.provider_override`,
+`llm.model_override`, `llm.agent_id_override`, `llm.profile_override`,
+`llm.task_override` (see `hermes_cli/plugin_capabilities.py` for the
+canonical registry). Unknown ids are ignored. The older per-capability
+config keys (`plugins.entries.<id>.allow_tool_override`, …) still work but
+are deprecated — declare capabilities instead so users get a single,
+auditable consent screen. Capabilities are consent + audit, **not a
+sandbox**: they gate host API surfaces, nothing more.
+
+**Pip-distributed plugins** have no `plugin.yaml` directory once installed,
+so declare capabilities in distribution metadata instead, via the companion
+`hermes_agent.plugin_capabilities` entry-point group. Each declaration is
+named `<plugin-id>.<capability-id>` and points at the same object as your
+`hermes_agent.plugins` entry point:
+
+```toml
+[project.entry-points."hermes_agent.plugins"]
+calculator = "my_pkg:register"
+
+[project.entry-points."hermes_agent.plugin_capabilities"]
+"calculator.tools.override" = "my_pkg:register"
+```
+
+Hermes reads these from installed metadata without importing your code, so
+`hermes plugins capabilities` and the consent flow stay accurate for pip
+installs.
+
+### Manifest v2 reference
+
+`plugin.yaml` also supports an additive **v2 schema** (#64165). Every field is
+optional; a manifest without `manifest_version` is a v1 manifest and stays
+fully supported forever. Unknown fields never break loading — they are ignored
+with a warning (forward compatibility), and a `manifest_version` newer than
+this Hermes understands still loads with a warning.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `manifest_version` | int | Manifest **file-format** version. Absent = `1`. Current max: `2`. Independent from `api_version`. |
+| `api_version` | int | Runtime **plugin API generation** the plugin targets (ctx surface / hook signatures). Deliberately a separate axis from `manifest_version` — an `api_version: 1` plugin can use a v2 manifest. |
+| `requires_plugins` | list | Inter-plugin dependencies: `- id: other-plugin` with optional `version_range: ">=1.0,<2"`. **Advisory**: a missing dependency logs a clear warning but the plugin still loads — probe at runtime with `ctx.has_plugin("other-plugin")`. Load **order** honors these edges: when A requires B, B's `register()` runs before A's (topological sort, alphabetical tiebreak; cycles warn and fall back to alphabetical order). |
+| `python_dependencies` | list of str | Declared pip requirements (e.g. `"requests>=2.0,<3"`). **Declaration seam only** — Hermes validates them, and `hermes plugins install` / `hermes plugins doctor` surface missing ones with a `pip install` hint, but Hermes **never auto-installs** them. Pin upper bounds. |
+| `config_schema` | mapping | JSON-schema-ish description of keys under `plugins.entries.<id>.settings`: `api_url: {type: str, default: "", description: "...", required: false}`. Validated at load; mismatches log actionable warnings naming the key and expected type — never load failures. Types: `str`, `int`, `float`, `bool`, `list`, `dict` (plus JSON-schema aliases). |
+| `license` | str | SPDX-style license id (e.g. `MIT`). |
+| `homepage` | str | Project URL. |
+| `tags` | list of str | Free-form discovery tags (e.g. `[gateway, telegram]`). |
+
+```yaml
+# plugin.yaml — manifest v2 example
+name: my-plugin
+version: 1.2.0
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/owner/my-plugin
+tags: [gateway, demo]
+requires_plugins:
+  - id: other-plugin
+    version_range: ">=1.0,<2"
+python_dependencies:
+  - "somepkg>=1.0,<2"     # surfaced, never auto-installed
+config_schema:
+  api_url: {type: str, default: "", description: "Service endpoint"}
+```
+
+:::note pip-dependency isolation is deferred
+`python_dependencies` is intentionally declare-and-surface only. Installing
+arbitrary packages into Hermes' shared venv is a conflict and supply-chain
+surface, so the install seam's isolation design (constraints-file installs
+against the host lock vs. per-plugin vendored dirs vs. conflict detection
+with refusal) is an explicitly deferred follow-up — see the round-2 review on
+[#64165](https://github.com/NousResearch/hermes-agent/issues/64165) and
+[#15220](https://github.com/NousResearch/hermes-agent/issues/15220). Plugin
+packs (#64166) build on these v2 fields.
+:::
 
 ## Step 3: Write the tool schemas
 
@@ -816,6 +911,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
+| [`gateway_platform_event`](/user-guide/features/hooks#gateway_platform_event) | An authorized platform-native event is normalized at the gateway boundary (Telegram reactions currently) | `platform: str, event_type: str, payload: dict` | ignored |
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |

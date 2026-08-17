@@ -470,10 +470,12 @@ below lets you require human review before those changes land.
 
 ### When the Agent Creates Skills
 
-- After completing a complex task (5+ tool calls) successfully
+The system prompt asks the agent to record a non-trivial workflow with `skill_manage` for
+future reuse. In practice that covers:
+
+- When it worked out a multi-step workflow worth repeating
 - When it hit errors or dead ends and found the working path
 - When the user corrected its approach
-- When it discovered a non-trivial workflow
 
 ### Actions
 
@@ -754,9 +756,12 @@ The hub now tracks enough provenance to re-check upstream copies of installed sk
 hermes skills check          # Report which installed hub skills changed upstream
 hermes skills update         # Reinstall only the skills with updates available
 hermes skills update react   # Update one specific installed hub skill
+hermes skills update react --force   # Overwrite a skill you've edited locally
 ```
 
 This uses the stored source identifier plus the current upstream bundle content hash to detect drift.
+
+Skills you have edited locally (the on-disk content no longer matches the hash recorded at install time) are **skipped** by `hermes skills update` so your changes are never silently overwritten. Pass `--force` to replace them with the upstream version anyway.
 
 :::tip GitHub rate limits
 Skills hub operations use the GitHub API, which has a rate limit of 60 requests/hour for unauthenticated users. If you see rate-limit errors during install or search, set `GITHUB_TOKEN` in your `.env` file to increase the limit to 5,000 requests/hour. The error message includes an actionable hint when this happens.
