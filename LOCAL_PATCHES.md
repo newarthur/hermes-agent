@@ -1,8 +1,8 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-08-08
-> 上游合并: 2026-08-08（已合并 `upstream/main` 的 666 个新 commits；本地补丁逻辑全部保留，00-current-local-overlay.patch 重新生成，核心回归 505 passed）
+> 最后更新: 2026-08-17
+> 上游合并: 2026-08-17（已合并 `upstream/main` 的 1528 个新 commits 至 `17fa4e2944`；本地补丁逻辑全部保留，00-current-local-overlay.patch 重新生成，核心回归 527 passed）
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
