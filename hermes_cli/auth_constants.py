@@ -114,7 +114,7 @@ DEFAULT_SPOTIFY_SCOPE = " ".join((
     "user-read-recently-played", "playlist-read-private", "playlist-read-collaborative",
     "playlist-modify-public", "playlist-modify-private", "user-library-read", "user-library-modify",
 ))
-SERVICE_PROVIDER_NAMES: Dict[str, str] = {"spotify": "Spotify"}
+SERVICE_PROVIDER_NAMES: Dict[str, str] = {"spotify": "Spotify", "google-gemini-cli": "Google Gemini (OAuth)"}
 
 # LM Studio's default no-auth mode still needs *some* non-empty bearer for the API-key code paths to
 # treat the provider as configured. Sent only to LM Studio, never to a remote service.
