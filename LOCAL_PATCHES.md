@@ -1,8 +1,9 @@
 # Hermes 本地 Patch 清单
 
 > 维护者: NEWARTHUR
-> 最后更新: 2026-09-09
-> 上游合并: 2026-09-09（已合并 `upstream/main` 的 5303 个新 commits 至 `c8aa5608c2`；升级至 Hermes v0.21.1，本地补丁逻辑全部保留，00-current-local-overlay.patch 重新生成，核心回归测试全部通过）
+> 最后更新: 2026-09-14
+> 上游合并: 2026-09-14（目标 `upstream/main` 为 `5eb99eb284`，Hermes v0.21.2；以已验证的上次上游快照 `c8aa5608c2` 作三方合并基准，保留本地补丁并连接真实上游历史。）
+> 更新验证: 隔离工作树验证后发布；canonical overlay 从最终提交生成。恢复测试使用上游隔离 runner，Kimi sanitizer 测试迁移到 `tests/agent/test_run_agent.py`。
 > 关联技能: hermes-safe-update-with-local-patches
 
 ## 概述
