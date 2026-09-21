@@ -36,7 +36,7 @@ def test_list_authenticated_providers_collapses_kimi_alias_env_to_canonical(monk
     same backend.
     """
     monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-test")
-    monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", lambda _provider: [])
+    monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", lambda _provider, **_kw: [])
     monkeypatch.setattr(
         "agent.models_dev.fetch_models_dev",
         lambda: {"kimi-for-coding": {"name": "Kimi For Coding"}},
@@ -275,7 +275,7 @@ def test_list_authenticated_providers_openai_codex_built_in_nonzero_total(monkey
     )
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids",
-        lambda provider: ["gpt-5.5"] if provider == "openai-codex" else [],
+        lambda provider, **_kw: ["gpt-5.5"] if provider == "openai-codex" else [],
     )
 
     providers = list_authenticated_providers(
