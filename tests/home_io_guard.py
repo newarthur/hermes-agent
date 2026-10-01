@@ -24,6 +24,10 @@ _INTERPRETER_PREFIXES = tuple({
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
+    # Allow manifest.json probes in hermes home parent directory during bootstrap tests
+    Path(__file__).resolve().parent.parent.parent / "manifest.json",
+    # Allow worktree gitdir probes pointing back to main checkout inside real home
+    Path(__file__).resolve().parent.parent.parent,
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
