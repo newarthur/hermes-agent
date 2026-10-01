@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 from hermes_cli.models import (
     _PROVIDER_MODELS,
-    _merge_with_models_dev,
+    _MODELS_DEV_PREFERRED, _merge_with_models_dev,
     provider_model_ids,
 )
 
