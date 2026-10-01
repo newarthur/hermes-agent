@@ -44,7 +44,12 @@ def _format_live_review_output(sid: str, session: Optional[dict], arg: str) -> s
     runtime_token = _current_runtime_session_record.set(session)
     try:
         from agent.review_engine import format_dispatch_note, start_review
-        result = start_review(agent, snapshot, arg or "")
+        # slash.exec is off-turn (RPC pool). start_review → resolve_runtime_provider
+        # reads HERMES_CODEX_BASE_URL via get_secret; under multiplex that raises
+        # UnscopedSecretError unless the same runtime scope a turn binds is here
+        # (#117544; same wrap as _compress_live_with_feedback / #116611).
+        with _session_profile_runtime_scope(session):
+            result = start_review(agent, snapshot, arg or "")
     except ValueError as exc:
         return str(exc)
     except Exception as exc:
@@ -99,7 +104,7 @@ def _format_live_history_output(sid: str, session: dict, arg: str) -> str:
     with session["history_lock"]:
         history = list(session.get("history", []))
     db_history = _live_session_messages(session)
-    messages = _history_to_messages(history if db_history is None else db_history)
+    messages = _history_to_messages(history if db_history is None else db_history, profile_home=session.get("profile_home"))
     if not messages:
         return "No conversation history yet."
     lines = ["Conversation History", "────────────────────────────────────────"]
@@ -112,28 +117,15 @@ def _format_live_history_output(sid: str, session: dict, arg: str) -> str:
     return "\n".join(lines)
 
 
-def _format_live_prompt_output(sid: str, session: dict, arg: str) -> str:
-    agent = session.get("agent")
-    mirror = _metadata_mirror(session)
-    if agent is None and "system_prompt" not in mirror:
-        return _NO_AGENT
-    prompt = (
-        mirror.get("system_prompt") or getattr(agent, "ephemeral_system_prompt", None)
-        or getattr(agent, "_cached_system_prompt", None) or "")
-    if not prompt:
-        return "Current system prompt is not built yet; send a message first."
-    return f"Current system prompt:\n{prompt}"
-
-
 def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
     from collections import Counter
     try:
-        messages = _history_to_messages(_live_session_messages(session) or [])
+        messages = _history_to_messages(_live_session_messages(session) or [], profile_home=session.get("profile_home"))
     except Exception:
         messages = []  # malformed db rows fall back to the live history below
     if not messages:
         with session["history_lock"]:
-            messages = _history_to_messages(list(session.get("history", [])))
+            messages = _history_to_messages(list(session.get("history", [])), profile_home=session.get("profile_home"))
     usage = _session_usage_snapshot(session)
     mirror = _metadata_mirror(session)
     lines = [f"Conversation: {len(messages)} messages" if messages else "Conversation is empty (no messages yet)."]
@@ -212,7 +204,6 @@ _LIVE_SLASH_OUTPUT = {
     "usage": (_NO_AGENT_USAGE, _format_live_usage_output),
     "review": (None, _format_live_review_output),
     "history": ("No conversation history yet.", _format_live_history_output),
-    "prompt": (_NO_AGENT, _format_live_prompt_output),
     "status": (None, _format_live_status_output),
     "context": ("Conversation is empty (no messages yet).", _format_live_context_output),
     "tools": ("No tools available.", _format_live_tools_output),
@@ -245,7 +236,7 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
 # Read-then-mutate live agent/session state that a running turn is using; rejected
 # while running (parity with session.compress / session.undo and the gateway's
 # running-agent /model guard).
-_MUTATES_WHILE_RUNNING = frozenset({"model", "personality", "prompt", "compress"})
+_MUTATES_WHILE_RUNNING = frozenset({"model", "personality", "compress"})
 
 
 def _compress_live_with_feedback(sid: str, session: dict, agent, arg: str, *, snapshot_kwargs: bool) -> str:
@@ -311,14 +302,8 @@ def _mirror_personality(sid, session, agent, arg) -> None:
         _apply_personality_to_session(sid, session, new_prompt, pname)
 
 
-def _mirror_prompt(sid, session, agent, arg) -> None:
-    if agent:
-        cfg = _load_cfg()
-        agent.ephemeral_system_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", "")) or None
-        agent._cached_system_prompt = None
-
-
-_FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None, "auto": "auto", "cold": "cold"}
+_FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None, "auto": "auto", "cold": "cold",
+               "ultrafast": "ultrafast"}
 
 
 def _mirror_fast(sid, session, agent, arg) -> None:
@@ -335,14 +320,16 @@ def _mirror_reload_mcp(sid, session, agent, arg) -> None:
 
 def _mirror_stop(sid, session, agent, arg) -> None:
     from tools.process_registry import process_registry
-    process_registry.kill_all()
+    # Deliberate user stop: an explicit source keeps it reaching
+    # persist_on_release jobs (#41225).
+    process_registry.kill_all(source="slash.stop")
 
 
 # name → mirror(sid, session, agent, arg); a falsy return means "no warning".
 _SLASH_MIRRORS = {
     "model": lambda sid, session, agent, arg: (
         _apply_model_switch(sid, session, arg).get("warning", "") if arg and agent else ""),
-    "approvals": _mirror_approvals, "personality": _mirror_personality, "prompt": _mirror_prompt,
+    "approvals": _mirror_approvals, "personality": _mirror_personality,
     "compress": lambda sid, session, agent, arg: (
         _compress_live_with_feedback(sid, session, agent, arg, snapshot_kwargs=False) if agent else ""),
     "fast": _mirror_fast,
@@ -391,7 +378,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if (mirror := _SLASH_MIRRORS.get(name)) is None:
         return ""
     try:
-        return mirror(sid, session, agent, arg) or ""
+        # Mirrors run OFF-turn (slash.exec RPC pool / compute-host control reader): bind the session's
+        # profile scope or /model's credential read raises UnscopedSecretError under multiplex (#122655).
+        with _session_profile_runtime_scope(session):
+            return mirror(sid, session, agent, arg) or ""
     except Exception as e:
         if name == "compress" and agent:
             from agent.conversation_compression import finalize_context_engine_compression_notification
