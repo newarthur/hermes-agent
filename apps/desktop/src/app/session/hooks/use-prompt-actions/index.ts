@@ -975,8 +975,7 @@ export function usePromptActions({
 
       // Active sessions publish their transcript into $sessionStates[runtimeId];
       // the global $messages mirror is empty/divergent for them (#68734).
-      const messages =
-        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
+      const messages = (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
 
       const plan = planReload(messages, parentId)
 
@@ -1038,8 +1037,7 @@ export function usePromptActions({
       }
 
       // Same dual-store read as reloadFromMessage (#68734).
-      const messages =
-        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
+      const messages = (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
 
       const plan = planRestore(messages, messageId, target)
 
@@ -1093,6 +1091,7 @@ export function usePromptActions({
             }
 
             const refreshed = $messages.get()
+
             const retryPlan = planRestore(refreshed, messageId, {
               text: target?.text ?? plan.sourceText,
               userOrdinal: target?.userOrdinal ?? plan.truncateOrdinal
@@ -1155,8 +1154,7 @@ export function usePromptActions({
       const sessionId = activeSessionIdRef.current
 
       // Same dual-store read as reloadFromMessage (#68734).
-      const messages =
-        (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
+      const messages = (sessionId ? $sessionStates.get()[sessionId]?.messages : null) ?? $messages.get()
 
       const plan = sessionId ? planEdit(messages, edited) : null
 
