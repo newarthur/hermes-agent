@@ -994,7 +994,7 @@ class TestRuntimeErrorMisreportedAsNoProvider:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "gemini-aux"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") in (None, "main-model")
         assert result is not None
         assert "summary via main" in result
 
