@@ -384,7 +384,7 @@ For installations managed by the app, open **Settings → About → Danger zone*
 
 The app closes to finish the job (the cleanup runs after it exits so it can remove the running app bundle and its own venv). The agent-removing options are hidden automatically when no local agent is installed.
 
-These controls are hidden for Nix, bundled/Light packages, and other externally owned installations. Remove those through their package manager or the operating system instead. The app checks its own local package ownership, independently of a remote backend's update status. If ownership cannot be confirmed, no uninstall actions are offered.
+These controls are hidden for Nix, bundled packages, and other externally owned installations. Remove those through their package manager or the operating system instead. The app checks its own local package ownership, independently of a remote backend's update status. If ownership cannot be confirmed, no uninstall actions are offered.
 
 For self-managed installations, you can do the same from the terminal — `hermes uninstall --gui` for the GUI alone, or `hermes uninstall` / `hermes uninstall --full` for the agent too.
 
@@ -393,6 +393,8 @@ Preview GUI cleanup with `hermes uninstall --gui --dry-run`. It lists the remova
 :::note
 Running `hermes uninstall --gui` from a **source checkout** (a `hermes desktop` dev build) removes `apps/desktop/{dist,release,node_modules}` and the desktop build stamp. The workspace-root `node_modules` stays installed because it is shared with the TUI, dashboard and other workspaces. Rebuild the GUI with `hermes desktop` if you need it again.
 :::
+
+`hermes update` keeps a desktop app current once it has been built in the checkout, even on a server that never opens it. On a headless Linux host, or when the desktop app's own Node dependencies fail to install (for example a compiler too old for `node-pty`), the update still builds the TUI and web UI, reports the desktop build as owed, and suggests `hermes uninstall --gui`. After that uninstall, later updates skip the desktop app.
 
 ## CLI reference: `hermes desktop`
 
@@ -583,8 +585,8 @@ Hermes: **one row per plugin**, with two switch columns.
   half is **not** installed in the selected profile shows **Install here**,
   which pre-fills the install dialog from the package's origin (catalog entry
   or git remote) for that profile only. Optional extras such as the
-  [Accent Picker](https://github.com/NousResearch/hermes-desktop-accent-picker)
-  install from their own repos via **Install from Git**.
+  [Accent Picker](https://github.com/NousResearch/hermes-official-plugins/tree/main/accent-picker)
+  install from the plugin catalog.
 - **Uninstall** — every plugin installed under the selected profile's
   `plugins/` folder (user or git install) has a trash button beside its name.
   It asks for confirmation, then deletes the plugin's files and install
