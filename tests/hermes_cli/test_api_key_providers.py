@@ -517,7 +517,7 @@ class TestHasAnyProviderConfigured:
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         config_file = hermes_home / "config.yaml"
-        config_file.write_text(yaml.dump({
+        config_file.write_text(yaml.safe_dump({
             "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"},
         }))
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
@@ -563,7 +563,7 @@ class TestHasAnyProviderConfigured:
         """
         import hermes_yaml as yaml
         hermes_home = self._setup_home(monkeypatch, tmp_path)
-        (hermes_home / "config.yaml").write_text(yaml.dump({
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
             "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"},
         }))
         sweep_calls = []
@@ -584,7 +584,7 @@ class TestHasAnyProviderConfigured:
         short-circuit before the registry sweep."""
         import hermes_yaml as yaml
         hermes_home = self._setup_home(monkeypatch, tmp_path)
-        (hermes_home / "config.yaml").write_text(yaml.dump({
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
             "model": {
                 "default": "local/custom-model",
                 "base_url": "http://localhost:8000/v1",
