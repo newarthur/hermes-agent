@@ -1407,8 +1407,29 @@ def list_picker_providers(
     from hermes_cli.models_validate import drop_unofferable_model_ids
 
     drop_unofferable_model_ids(filtered)
-    _attach_window_model_notes(filtered)
-    return filtered
+    # LA policy: apply exclusions to the final payload, including virtual MoA.
+    excluded = {str(slug).strip().lower() for slug in (excluded_providers or [])}
+    filtered = [row for row in filtered if str(row.get("slug", "")).lower() not in excluded]
+    native_ids = {
+        str(row.get("slug", "")).lower(): {str(mid).lower() for mid in row.get("models", [])}
+        for row in filtered
+    }
+    result = []
+    for row in filtered:
+        if str(row.get("slug", "")).lower() == "copilot":
+            models = []
+            for mid in row.get("models", []):
+                key = str(mid).lower()
+                owner = ("openai-codex" if key.startswith("gpt-") else
+                         "anthropic" if key.startswith("claude-") else
+                         "kimi-coding" if key.startswith("kimi-") else "")
+                if key not in native_ids.get(owner, set()):
+                    models.append(mid)
+            row = dict(row, models=models, total_models=len(models))
+        if row.get("models") or (row.get("is_user_defined") and row.get("api_url")):
+            result.append(row)
+    _attach_window_model_notes(result)
+    return result
 
 
 def _attach_window_model_notes(providers: list[dict]) -> None:

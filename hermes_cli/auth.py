@@ -186,7 +186,7 @@ _REGISTRY_ROWS: tuple[Any, ...] = (
      ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"), "GLM_BASE_URL"),
     # Legacy platform.moonshot.ai keys use this endpoint (OpenAI-compat); sk-kimi- (Kimi Code)
     # keys are auto-redirected to api.kimi.com/coding by _resolve_kimi_base_url().
-    ("kimi-coding", "Kimi / Moonshot", "https://api.moonshot.ai/v1",
+    ("kimi-coding", "Kimi / Kimi Coding Plan", KIMI_CODE_BASE_URL,
      ("KIMI_API_KEY", "KIMI_CODING_API_KEY"), "KIMI_BASE_URL"),
     ("kimi-coding-cn", "Kimi / Moonshot (China)", "https://api.moonshot.cn/v1", ("KIMI_CN_API_KEY",)),
     ("stepfun", "StepFun Step Plan", STEPFUN_STEP_PLAN_INTL_BASE_URL, ("STEPFUN_API_KEY",), "STEPFUN_BASE_URL"),

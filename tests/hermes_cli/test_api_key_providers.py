@@ -29,8 +29,6 @@ class TestProviderRegistry:
     """Test that new providers are correctly registered."""
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
-        ("copilot-acp", "GitHub Copilot ACP", "external_process"),
-        ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
         ("xai", "xAI", "api_key"),
@@ -53,10 +51,6 @@ class TestProviderRegistry:
 
 
 
-    def test_copilot_env_vars(self):
-        pconfig = PROVIDER_REGISTRY["copilot"]
-        assert pconfig.api_key_env_vars == ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
-        assert pconfig.base_url_env_var == "COPILOT_API_BASE_URL"
 
     def test_kimi_env_vars(self):
         pconfig = PROVIDER_REGISTRY["kimi-coding"]
@@ -103,8 +97,6 @@ class TestProviderRegistry:
         assert pconfig.base_url_env_var == "HF_BASE_URL"
 
     def test_base_urls(self):
-        assert PROVIDER_REGISTRY["copilot"].inference_base_url == "https://api.githubcopilot.com"
-        assert PROVIDER_REGISTRY["copilot-acp"].inference_base_url == "acp://copilot"
         assert PROVIDER_REGISTRY["zai"].inference_base_url == "https://api.z.ai/api/paas/v4"
         assert PROVIDER_REGISTRY["kimi-coding"].inference_base_url == KIMI_CODE_BASE_URL
         assert PROVIDER_REGISTRY["stepfun"].inference_base_url == STEPFUN_STEP_PLAN_INTL_BASE_URL
@@ -235,15 +227,8 @@ class TestResolveProvider:
         assert parse_model_input("chatgpt-codex:gpt-5.5", "openrouter") == ("openai-codex", "gpt-5.5")
         assert _normalize_provider("chatgpt") == "openai-codex"
 
-    def test_alias_github_copilot(self):
-        assert resolve_provider("github-copilot") == "copilot"
 
-    def test_alias_github_models(self):
-        assert resolve_provider("github-models") == "copilot"
 
-    def test_alias_github_copilot_acp(self):
-        assert resolve_provider("github-copilot-acp") == "copilot-acp"
-        assert resolve_provider("copilot-acp-agent") == "copilot-acp"
 
     def test_explicit_huggingface(self):
         assert resolve_provider("huggingface") == "huggingface"
@@ -527,7 +512,7 @@ class TestHasAnyProviderConfigured:
 
     def test_config_provider_counts(self, monkeypatch, tmp_path):
         """config.yaml with model.provider set should count as configured."""
-        import yaml
+        import hermes_yaml as yaml
         from hermes_cli import config as config_module
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -576,7 +561,7 @@ class TestHasAnyProviderConfigured:
         loop in ``except Exception``, so we also record every call — any
         recorded call proves the sweep ran even if the raise was swallowed.
         """
-        import yaml
+        import hermes_yaml as yaml
         hermes_home = self._setup_home(monkeypatch, tmp_path)
         (hermes_home / "config.yaml").write_text(yaml.dump({
             "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"},
@@ -597,7 +582,7 @@ class TestHasAnyProviderConfigured:
     def test_config_base_url_api_key_skips_registry_sweep(self, monkeypatch, tmp_path):
         """Custom endpoint (base_url/api_key in config, no provider) must also
         short-circuit before the registry sweep."""
-        import yaml
+        import hermes_yaml as yaml
         hermes_home = self._setup_home(monkeypatch, tmp_path)
         (hermes_home / "config.yaml").write_text(yaml.dump({
             "model": {

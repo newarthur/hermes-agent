@@ -263,7 +263,7 @@ def test_cross_provider_duplicate_models_deduped(monkeypatch):
         "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
     )
 
-    rows = model_switch.list_picker_providers(include_moa=True)
+    rows = model_switch_providers.list_picker_providers(include_moa=True)
     by_slug = {row["slug"]: row for row in rows}
     assert "copilot" not in by_slug  # all its models were duplicates
     assert by_slug["anthropic"]["models"] == ["claude-sonnet-5", "claude-sonnet-4"]
@@ -289,7 +289,7 @@ def test_cross_provider_duplicate_keeps_copilot_only_models(monkeypatch):
         "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
     )
 
-    rows = model_switch.list_picker_providers(include_moa=True)
+    rows = model_switch_providers.list_picker_providers(include_moa=True)
     by_slug = {row["slug"]: row for row in rows}
     assert by_slug["copilot"]["models"] == ["copilot-custom-1"]
     assert by_slug["openai-codex"]["models"] == ["gpt-5.4"]
@@ -314,7 +314,7 @@ def test_excluded_providers_drop_final_rows_including_moa(monkeypatch):
         "hermes_cli.models.fetch_openrouter_models", lambda *a, **kw: []
     )
 
-    rows = model_switch.list_picker_providers(
+    rows = model_switch_providers.list_picker_providers(
         include_moa=True,
         excluded_providers=["moa", "openrouter", "copilot"],
     )
